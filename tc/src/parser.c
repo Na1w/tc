@@ -896,12 +896,19 @@ static Node* parse_declaration(Parser *p) {
         advance(p); /* consume ( */
         ParamDecl *params = NULL;
         int nparams = 0;
+        int is_variadic = 0;
         int pcap = 4;
         params = (ParamDecl *)malloc(sizeof(ParamDecl) * (size_t)pcap);
 
         if (p->current.kind != TOK_RPAREN) {
             while (1) {
                 if (p->current.kind == TOK_KW_VOID) {
+                    advance(p);
+                    break;
+                }
+                // Check for variadic (...) as the last parameter
+                if (p->current.kind == TOK_ELLIPSIS) {
+                    is_variadic = 1;
                     advance(p);
                     break;
                 }
@@ -953,6 +960,7 @@ static Node* parse_declaration(Parser *p) {
             n->u.func_decl.ret_type_id = type_id;
             n->u.func_decl.params = params;
             n->u.func_decl.nparams = nparams;
+            n->u.func_decl.is_variadic = is_variadic;
             n->u.func_decl.body = body;
             (void)hash;
             (void)ptr_stars;
@@ -969,6 +977,7 @@ static Node* parse_declaration(Parser *p) {
         n->u.func_decl.ret_type_id = type_id;
         n->u.func_decl.params = NULL;
         n->u.func_decl.nparams = 0;
+        n->u.func_decl.is_variadic = is_variadic;
         n->u.func_decl.body = NULL;
         (void)hash;
         (void)ptr_stars;

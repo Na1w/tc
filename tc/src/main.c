@@ -24,6 +24,8 @@
 #include "ir.h"
 #include "opt.h"
 #include "x86_64.h"
+#include "disasm.h"
+#include "elf.h"
 
 /* ==================================================================
  * File I/O
@@ -63,7 +65,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -o <file>    Output file (default: a.out)\n");
     fprintf(stderr, "  -S           Emit assembly listing only\n");
     fprintf(stderr, "  -c           Compile only, no link (ELF object)\n");
-    fprintf(stderr, "  -d <phase>   Dump after phase (ast, sema, ir, opt)\n");
+    fprintf(stderr, "  -d <phase>   Dump after phase (ast, sema, ir, opt, disasm)\n");
     fprintf(stderr, "  -v           Verbose\n");
     fprintf(stderr, "  -h           Show this help\n");
 }
@@ -476,6 +478,7 @@ int main(int argc, char *argv[]) {
     const char *dump_phase = NULL;
     int emit_asm = 0;       /* -S: assembly only */
     int verbose = 0;
+    int disasm_mode = 0;  /* -d disasm: disassemble generated code */
 
     /* ---- Parse CLI arguments ---- */
     for (int i = 1; i < argc; i++) {
@@ -487,6 +490,9 @@ int main(int argc, char *argv[]) {
             /* -c: compile only (ELF object) — same as normal for now */
         } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             dump_phase = argv[++i];
+            if (strcmp(dump_phase, "disasm") == 0) {
+                disasm_mode = 1;
+            }
         } else if (strcmp(argv[i], "-v") == 0) {
             verbose = 1;
         } else if (strcmp(argv[i], "-h") == 0) {
@@ -685,6 +691,15 @@ int main(int argc, char *argv[]) {
         cleanup(source, lexer, parser, sema, ir);
         return 1;
     }
+    /* ================================================================
+     *  Disassembly output (if -d disasm)
+     * ================================================================ */
+    if (disasm_mode) {
+        fprintf(stderr, "=== Disassembly of .text section (%zu bytes) ===\n", cg->code_size);
+        disasm_x86_64(cg->code, cg->code_size, ELF_TEXT_BASE, stderr);
+        fprintf(stderr, "=== End of disassembly ===\n");
+    }
+
     if (verbose) fprintf(stderr, "tc: codegen done, wrote '%s'\n", output_file);
 
     /* ================================================================

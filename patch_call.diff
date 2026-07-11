@@ -1,0 +1,15 @@
+--- src/x86_64_emit.c.fixed	2026-07-11 04:07:19.879946711 +0000
++++ src/x86_64_emit.c	2026-07-11 07:50:49.778971168 +0000
+@@ -172,10 +172,10 @@
+ {
+     uint8_t db = (uint8_t)((dst >= 8) ? 1 : 0);
+     uint8_t sb = (uint8_t)((src >= 8) ? 1 : 0);
+-    cg_emit_byte(cg, rex_w(sb, db));
++    cg_emit_byte(cg, rex_w(db, sb));
+     cg_emit_byte(cg, 0x0F);
+     cg_emit_byte(cg, 0xAF);
+-    cg_emit_byte(cg, (uint8_t)(0xC0 | ((src & 7) << 3) | (dst & 7)));
++    cg_emit_byte(cg, (uint8_t)(0xC0 | ((dst & 7) << 3) | (src & 7)));
+ }
+ 
+ /* and r64, r64 : REX 21 /r */

@@ -89,6 +89,7 @@ int sema_analyze(SemaContext *sema, Node *ast);
 
 /* Lookup an identifier by hash + name, walking scope chain upward. */
 Symbol *sema_lookup(SemaContext *sema, uint32_t hash, const char *name);
+uint32_t hash_name(const char *name);
 
 /* Get a Type pointer by its table index. */
 Type *sema_get_type(SemaContext *sema, int type_id);

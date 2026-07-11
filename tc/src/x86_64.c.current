@@ -1,0 +1,688 @@
+/*
+ * tc/src/x86_64.c  --  x86-64 code generator for tc compiler
+ *
+ * Implements a complete linear-scan register allocator and
+ * ELF64 binary emitter targeting the Linux x86-64 System V ABI.
+ */
+
+#include "x86_64.h"
+#include "x86_64_emit.h"
+#include "x86_64_instr.h"
+#include "elf.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+/* ------------------------------------------------------------------ */
+/*  Register constants                                                */
+/* ------------------------------------------------------------------ */
+
+#define R_RAX   0
+#define R_RCX   1
+#define R_RDX   2
+#define R_RBX   3
+#define R_RSP   4
+#define R_RBP   5
+#define R_RSI   6
+#define R_RDI   7
+#define R_R8    8
+#define R_R9    9
+#define R_R10   10
+#define R_R11   11
+#define R_R12   12
+#define R_R13   13
+#define R_R14   14
+#define R_R15   15
+
+/* Callee-saved registers we might allocate (bit positions in mask) */
+#define CS_RBX   0   /* bit 0 */
+#define CS_R12   1   /* bit 1 */
+#define CS_R13   2   /* bit 2 */
+#define CS_R14   3   /* bit 3 */
+#define CS_R15   4   /* bit 4 */
+#define CS_COUNT 5
+
+/* Argument registers for calls */
+
+/* Caller-saved registers */
+static const int CALLER_SAVED[] = {
+    R_RAX, R_RCX, R_RDX, R_RSI, R_RDI, R_R8, R_R9, R_R10, R_R11
+};
+#define CALLER_SAVED_COUNT 9
+
+/* Allocatable registers (rsp and rbp reserved) */
+static const int ALLOC_REGS[] = {
+    R_RAX, R_RCX, R_RDX, R_RBX, R_RSI, R_RDI,
+    R_R8, R_R9, R_R10, R_R11, R_R12, R_R13, R_R14, R_R15
+};
+#define ALLOC_REG_COUNT 14
+
+/* ------------------------------------------------------------------ */
+/*  Label lookup helpers                                               */
+/* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/*  Temp location helpers                                              */
+/* ------------------------------------------------------------------ */
+
+static void temp_init(CodeGen *cg)
+{
+    memset(cg->temps, 0, sizeof(cg->temps));
+    cg->max_temp = 0;
+}
+
+static void temp_set_reg(CodeGen *cg, int tid, int reg)
+{
+    if (tid < 0 || tid >= MAX_TEMP) return;
+    cg->temps[tid].assigned = 1;
+    cg->temps[tid].is_reg = 1;
+    cg->temps[tid].reg_code = reg;
+    cg->temps[tid].stack_off = 0;
+    if (tid > cg->max_temp)
+        cg->max_temp = tid;
+}
+
+static void temp_set_stack(CodeGen *cg, int tid, int offset)
+{
+    if (tid < 0 || tid >= MAX_TEMP) return;
+    cg->temps[tid].assigned = 1;
+    cg->temps[tid].is_reg = 0;
+    cg->temps[tid].stack_off = offset;
+    cg->temps[tid].reg_code = 0;
+    if (tid > cg->max_temp)
+        cg->max_temp = tid;
+}
+
+static int temp_is_assigned(CodeGen *cg, int tid)
+{
+    if (tid < 0 || tid >= MAX_TEMP) return 0;
+    return cg->temps[tid].assigned;
+}
+
+int temp_get_reg(CodeGen *cg, int tid)
+{
+    if (!temp_is_assigned(cg, tid)) return -1;
+    if (cg->temps[tid].is_reg) return cg->temps[tid].reg_code;
+    return -1;
+}
+
+int temp_get_stack_off(CodeGen *cg, int tid)
+{
+    if (!temp_is_assigned(cg, tid)) return 0;
+    return cg->temps[tid].stack_off;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Load temp into a register (spills from stack if needed)            */
+/* ------------------------------------------------------------------ */
+
+int cg_load_temp(CodeGen *cg, int tid)
+{
+    if (!temp_is_assigned(cg, tid)) return R_RAX;
+    int reg = temp_get_reg(cg, tid);
+    if (reg >= 0) return reg;
+    /* Spilled to stack: load into rax */
+    emit_mov_rmem_rbp(cg, R_RAX, temp_get_stack_off(cg, tid));
+    return R_RAX;
+}
+
+/* Store rax to temp's location */
+void cg_store_temp(CodeGen *cg, int tid)
+{
+    if (!temp_is_assigned(cg, tid)) return;
+    int reg = temp_get_reg(cg, tid);
+    if (reg >= 0 && reg != R_RAX) {
+        emit_mov_rr(cg, reg, R_RAX);
+    } else if (reg < 0) {
+        emit_mov_mem_rbp_r(cg, R_RAX, temp_get_stack_off(cg, tid));
+    }
+    /* if reg == RAX, value is already there */
+}
+
+/* ------------------------------------------------------------------ */
+/*  Register allocator: linear scan                                    */
+/* ------------------------------------------------------------------ */
+
+static int interval_cmp(const void *a, const void *b)
+{
+    const LiveInterval *ia = (const LiveInterval *)a;
+    const LiveInterval *ib = (const LiveInterval *)b;
+    if (ia->start < ib->start) return -1;
+    if (ia->start > ib->start) return 1;
+    return 0;
+}
+
+static int is_callee_saved(int reg)
+{
+    switch (reg) {
+        case R_RBX: return 1;
+        case R_R12: return 1;
+        case R_R13: return 1;
+        case R_R14: return 1;
+        case R_R15: return 1;
+        default: return 0;
+    }
+}
+
+static int reg_to_cs_bit(int reg)
+{
+    switch (reg) {
+        case R_RBX: return CS_RBX;
+        case R_R12: return CS_R12;
+        case R_R13: return CS_R13;
+        case R_R14: return CS_R14;
+        case R_R15: return CS_R15;
+        default: return -1;
+    }
+}
+
+static void cg_compute_intervals(CodeGen *cg, IRProgram *prog)
+{
+    cg->interval_count = 0;
+    /* Initialize intervals for all possible temps */
+    for (int i = 0; i < MAX_TEMP; i++) {
+        cg->intervals[i].temp_id = i;
+        cg->intervals[i].start = prog->count + 1; /* sentinel */
+        cg->intervals[i].end = -1;
+    }
+
+    /* Scan IR to find definitions and uses */
+    for (int i = 0; i < prog->count; i++) {
+        IRInstr *inst = &prog->instrs[i];
+
+        /* Definition */
+        if (inst->temp_id >= 0) {
+            int tid = inst->temp_id;
+            if (i < cg->intervals[tid].start)
+                cg->intervals[tid].start = i;
+        }
+
+        /* Uses */
+        if (inst->src_id >= 0) {
+            int tid = inst->src_id;
+            if (i > cg->intervals[tid].end)
+                cg->intervals[tid].end = i;
+        }
+        if (inst->src2_id >= 0) {
+            int tid = inst->src2_id;
+            if (i > cg->intervals[tid].end)
+                cg->intervals[tid].end = i;
+        }
+        /* CALL arg_ids */
+        if (inst->kind == IR_CALL || inst->kind == IR_CALL_IND) {
+            for (int a = 0; a < inst->arg_count; a++) {
+                int tid = inst->arg_ids[a];
+                if (i > cg->intervals[tid].end)
+                    cg->intervals[tid].end = i;
+            }
+        }
+    }
+
+    /* Collect valid intervals */
+    for (int i = 0; i < MAX_TEMP; i++) {
+        if (cg->intervals[i].end >= 0 && cg->intervals[i].start <= cg->intervals[i].end) {
+            LiveInterval *tmp = &cg->intervals[i];
+            cg->intervals[cg->interval_count].temp_id = tmp->temp_id;
+            cg->intervals[cg->interval_count].start = tmp->start;
+            cg->intervals[cg->interval_count].end = tmp->end;
+            cg->interval_count++;
+        }
+    }
+
+    /* Sort by start */
+    if (cg->interval_count > 1) {
+        qsort(cg->intervals, (size_t)cg->interval_count,
+              sizeof(LiveInterval), interval_cmp);
+    }
+}
+
+static void cg_linear_scan(CodeGen *cg)
+{
+    /* Initialize free registers */
+    cg->free_reg_count = ALLOC_REG_COUNT;
+    for (int i = 0; i < ALLOC_REG_COUNT; i++)
+        cg->free_regs[i] = ALLOC_REGS[i];
+    memset(cg->reg_owner, -1, sizeof(cg->reg_owner));
+
+    cg->callee_saved_mask = 0;
+    cg->frame_size = 0;
+    int spill_next = 0; /* next spill slot (negative from rbp) */
+
+    /* Track active intervals and their assigned registers */
+    typedef struct {
+        int interval_idx;
+        int reg;
+        int end;
+    } Active;
+    Active active[ALLOC_REG_COUNT];
+    int active_count = 0;
+
+    for (int i = 0; i < cg->interval_count; i++) {
+        LiveInterval *iv = &cg->intervals[i];
+
+        /* Expire old intervals */
+        for (int j = 0; j < active_count; j++) {
+            if (active[j].end < iv->start) {
+                /* Free this register */
+                int reg = active[j].reg;
+                cg->reg_owner[reg] = -1;
+                cg->free_regs[cg->free_reg_count++] = reg;
+                /* Remove from active list */
+                active[j] = active[active_count - 1];
+                active_count--;
+                j--;
+            }
+        }
+
+        if (cg->free_reg_count > 0) {
+            /* Assign a free register */
+            int reg = cg->free_regs[--cg->free_reg_count];
+            cg->reg_owner[reg] = i;
+            temp_set_reg(cg, iv->temp_id, reg);
+            if (is_callee_saved(reg)) {
+                int bit = reg_to_cs_bit(reg);
+                if (bit >= 0)
+                    cg->callee_saved_mask |= (1 << bit);
+            }
+            /* Add to active list */
+            if (active_count < ALLOC_REG_COUNT) {
+                active[active_count].interval_idx = i;
+                active[active_count].reg = reg;
+                active[active_count].end = iv->end;
+                active_count++;
+            }
+        } else {
+            /* Need to spill. Find the interval that ends furthest in the future */
+            int spill_idx = -1;
+            int spill_end = -1;
+            for (int j = 0; j < active_count; j++) {
+                if (active[j].end > spill_end) {
+                    spill_end = active[j].end;
+                    spill_idx = j;
+                }
+            }
+
+            if (spill_idx >= 0 && spill_end > iv->end) {
+                /* Spill the active interval that ends furthest */
+                Active *sa = &active[spill_idx];
+                int old_reg = sa->reg;
+                int old_tid = cg->intervals[sa->interval_idx].temp_id;
+
+                /* Move old temp to stack */
+                int slot = -8 * (1 + spill_next);
+                spill_next++;
+                temp_set_stack(cg, old_tid, slot);
+                if (-slot > cg->frame_size)
+                    cg->frame_size = -slot;
+
+                /* Free old register */
+                cg->reg_owner[old_reg] = -1;
+                cg->free_regs[cg->free_reg_count++] = old_reg;
+
+                /* Assign new temp to this register */
+                cg->reg_owner[old_reg] = i;
+                temp_set_reg(cg, iv->temp_id, old_reg);
+                if (is_callee_saved(old_reg)) {
+                    int bit = reg_to_cs_bit(old_reg);
+                    if (bit >= 0)
+                        cg->callee_saved_mask |= (1 << bit);
+                }
+
+                /* Update active entry */
+                sa->interval_idx = i;
+                sa->reg = old_reg;
+                sa->end = iv->end;
+            } else {
+                /* Spill current interval */
+                int slot = -8 * (1 + spill_next);
+                spill_next++;
+                temp_set_stack(cg, iv->temp_id, slot);
+                if (-slot > cg->frame_size)
+                    cg->frame_size = -slot;
+            }
+        }
+    }
+
+    /* Align frame_size to 16 bytes */
+    cg->frame_size = (cg->frame_size + 15) & ~15;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Spill/reload helpers for CALL instructions                         */
+/* ------------------------------------------------------------------ */
+
+/* Before a call: save all caller-saved regs that hold live temps */
+void cg_save_caller_saved(CodeGen *cg)
+{
+    /* Simple approach: push all caller-saved regs before call */
+    for (int i = 0; i < CALLER_SAVED_COUNT; i++) {
+        emit_push_r(cg, CALLER_SAVED[i]);
+    }
+    cg->pushed_bytes += 8 * CALLER_SAVED_COUNT;
+}
+
+/* After a call: restore caller-saved regs */
+void cg_restore_caller_saved(CodeGen *cg)
+{
+    /* Pop in reverse order */
+    for (int i = CALLER_SAVED_COUNT - 1; i >= 0; i--) {
+        emit_pop_r(cg, CALLER_SAVED[i]);
+    }
+    cg->pushed_bytes -= 8 * CALLER_SAVED_COUNT;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Stack alignment before CALL                                        */
+/* ------------------------------------------------------------------ */
+
+/* On x86-64 System V, rsp must be 16-byte aligned before CALL.
+   At function entry: rsp%16 == 8 because the call instruction placed
+   the return address.
+   After push rbp: rsp%16 == 0.
+   After push N callee-saved: rsp%16 == (8*N)%16 == 0 if N even, 8 if N odd.
+   After sub rsp, frame_size (16-aligned): same as above.
+   Before an outgoing CALL we push 9 caller-saved registers (72 bytes).
+   With N even: (0 + 8)%16 == 8 -> need a dummy push.
+   With N odd:  (8 + 8)%16 == 0 -> no dummy needed.
+   A dummy is required when the number of callee-saved registers is EVEN,
+   i.e. when 1 (rbp) + cs_count is ODD. */
+void cg_emit_call_align(CodeGen *cg)
+{
+    /* pushed_bytes includes: push rbp (8) + callee-saved pushes + frame_size
+       At CALL site, rsp = rbp - frame_size - (pushed_bytes - 8 - callee_saved*8)
+       Actually simpler: at function entry rsp%16==0.
+       After push rbp: rsp%16==8.
+       After push N callee-saved: rsp%16 == (8 + 8*N) % 16.
+       After sub rsp, frame_size: rsp%16 == (8 + 8*N + frame_size) % 16.
+       We need rsp%16==16 (==0) before call.
+       So if (8 + 8*N + frame_size) % 16 != 0, push/pop dummy.
+       But frame_size is 16-aligned, so we need (8 + 8*N) % 16 == 0,
+       meaning N must be odd.
+       Count callee-saved regs used: */
+    int cs_count = 0;
+    for (int b = 0; b < CS_COUNT; b++) {
+        if (cg->callee_saved_mask & (1 << b))
+            cs_count++;
+    }
+    /* Total pushes before sub rsp: 1 (rbp) + cs_count */
+    int total_pushes = 1 + cs_count;
+    if ((total_pushes & 1) == 1) {
+        /* Odd number of pushes => rsp is 8 mod 16 before caller-saved pushes */
+        emit_push_r(cg, R_RAX);
+        cg->pushed_bytes += 8;
+    }
+}
+
+void cg_emit_call_unalign(CodeGen *cg)
+{
+    int cs_count = 0;
+    for (int b = 0; b < CS_COUNT; b++) {
+        if (cg->callee_saved_mask & (1 << b))
+            cs_count++;
+    }
+    int total_pushes = 1 + cs_count;
+    if ((total_pushes & 1) == 1) {
+        emit_pop_r(cg, R_RAX);
+        cg->pushed_bytes -= 8;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Emit prologue                                                      */
+/* ------------------------------------------------------------------ */
+
+static void cg_emit_prologue(CodeGen *cg)
+{
+    /* push rbp */
+    emit_push_r(cg, R_RBP);
+    /* mov rbp, rsp */
+    emit_mov_rr(cg, R_RBP, R_RSP);
+
+    /* Push callee-saved regs (order: rbx, r12, r13, r14, r15) */
+    static const int CS_REGS[] = { R_RBX, R_R12, R_R13, R_R14, R_R15 };
+    for (int b = 0; b < CS_COUNT; b++) {
+        if (cg->callee_saved_mask & (1 << b)) {
+            emit_push_r(cg, CS_REGS[b]);
+        }
+    }
+
+    /* sub rsp, frame_size */
+    if (cg->frame_size > 0) {
+        emit_sub_rsp_imm32(cg, (int32_t)cg->frame_size);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Emit epilogue                                                      */
+/* ------------------------------------------------------------------ */
+
+void cg_emit_epilogue(CodeGen *cg)
+{
+    /* Pop callee-saved regs in reverse order BEFORE restoring rsp */
+    static const int CS_REGS[] = { R_RBX, R_R12, R_R13, R_R14, R_R15 };
+    for (int b = CS_COUNT - 1; b >= 0; b--) {
+        if (cg->callee_saved_mask & (1 << b)) {
+            emit_pop_r(cg, CS_REGS[b]);
+        }
+    }
+
+    /* mov rsp, rbp */
+    emit_mov_rr(cg, R_RSP, R_RBP);
+
+    /* pop rbp */
+    emit_pop_r(cg, R_RBP);
+    /* ret */
+    emit_ret(cg);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Emit _start entry point                                            */
+/* ------------------------------------------------------------------ */
+
+static void cg_emit_start(CodeGen *cg)
+{
+    /* _start:
+       ; Kernel entry: rsp -> argc, rsp+8 -> argv, rsp+16 -> envp
+       ; (rsp+8) % 16 == 0 guaranteed by kernel
+       ;
+       ; Save argc/argv before messing with stack
+       mov rdi, [rsp]          ; rdi = argc
+       mov rsi, [rsp+8]        ; rsi = argv
+       ;
+       ; Align stack to 16 bytes for call
+       and rsp, -16
+       sub rsp, 8              ; rsp%16 == 8 for call (ABI req)
+       ;
+       ; Call main
+       call main
+       ;
+       ; Exit with main's return value
+       mov rdi, rax
+       mov rax, 60
+       syscall
+    */
+    /* Record _start label */
+    cg_add_label(cg, "_start", (int)cg->code_size);
+
+    /* mov rdi, [rsp] -- load argc (64-bit)
+     * Use SIB byte to avoid mod=00,r/m=100 special case with [rsp] */
+    cg_emit_byte(cg, 0x48);  /* REX.W for 64-bit */
+    cg_emit_byte(cg, 0x8B);
+    cg_emit_byte(cg, 0x3C);  /* ModR/M: mod=00, reg=111(rdi), r/m=100 -> SIB follows */
+    cg_emit_byte(cg, 0x24);  /* SIB: scale=00, index=100(none), base=100(rsp) */
+
+    /* mov rsi, [rsp+8] -- load argv (use disp8 with SIB) */
+    cg_emit_byte(cg, 0x48);
+    cg_emit_byte(cg, 0x8B);
+    cg_emit_byte(cg, 0x74);  /* ModR/M: mod=01, reg=110(rsi), r/m=100 -> SIB follows */
+    cg_emit_byte(cg, 0x24);  /* SIB: scale=00, index=100(none), base=100(rsp) */
+    cg_emit_byte(cg, 8);     /* disp8: 8 */
+
+    /* and rsp, -16 (imm8 form: 0x83 /ib) */
+    cg_emit_byte(cg, 0x48);
+    cg_emit_byte(cg, 0x83);
+    cg_emit_byte(cg, 0xE4);  /* ModR/M: mod=11, reg=101(5), r/m=100(rsp) */
+    cg_emit_byte(cg, (uint8_t)(-16));
+
+    /* sub rsp, 8 -- align stack for call (need rsp%16==8 before call) */
+    cg_emit_byte(cg, 0x48);
+    cg_emit_byte(cg, 0x83);
+    cg_emit_byte(cg, 0xEC);  /* ModR/M: mod=11, reg=101(5), r/m=100(rsp) */
+    cg_emit_byte(cg, 8);     /* imm8: 8 */
+
+    /* call main (patch later) */
+    cg_emit_byte(cg, 0xE8);
+    int call_offset = (int)cg->code_size;
+    cg_emit_int32(cg, 0); /* placeholder */
+    /* Add patch -- look up "main" label; create placeholder if not found */
+    if (cg->patch_count < MAX_PATCHES) {
+        int lbl = cg_find_label(cg, "main");
+        if (lbl < 0) {
+            lbl = cg_add_label(cg, "main", -1);
+        }
+        cg->patches[cg->patch_count].code_offset = call_offset;
+        cg->patches[cg->patch_count].target_label_idx = lbl;
+        cg->patches[cg->patch_count].patch_size = 4;
+        cg->patch_count++;
+    }
+
+    /* mov rdi, rax (main's return value -> exit arg) */
+    emit_mov_rr(cg, R_RDI, R_RAX);
+    /* mov rax, 60 (exit syscall) */
+    emit_mov_rimm(cg, R_RAX, 60);
+    /* syscall */
+    emit_syscall(cg);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Code generation entry point                                        */
+/* ------------------------------------------------------------------ */
+
+CodeGen *cg_create(void)
+{
+    CodeGen *cg = calloc(1, sizeof(*cg));
+    if (!cg) return NULL;
+    cg->code_cap = 8192;
+    cg->code = malloc(cg->code_cap);
+    if (!cg->code) {
+        free(cg);
+        return NULL;
+    }
+    cg->rodata_cap = 4096;
+    cg->rodata = malloc(cg->rodata_cap);
+    if (!cg->rodata) {
+        free(cg->code);
+        free(cg);
+        return NULL;
+    }
+    memset(cg->code, 0, cg->code_cap);
+    memset(cg->rodata, 0, cg->rodata_cap);
+    return cg;
+}
+
+void cg_destroy(CodeGen *cg)
+{
+    if (!cg) return;
+    free(cg->code);
+    free(cg->rodata);
+    free(cg);
+}
+
+int cg_generate(CodeGen *cg, IRProgram *prog, const char *output_path)
+{
+    if (!cg || !prog) return -1;
+
+    /* Store output path */
+    snprintf(cg->output_path, sizeof(cg->output_path), "%s", output_path);
+
+    /* Reset state */
+    cg->code_size = 0;
+    cg->rodata_size = 0;
+    cg->label_count = 0;
+    cg->patch_count = 0;
+    cg->global_count = 0;
+    cg->param_count = 0;
+    cg->frame_size = 0;
+    cg->callee_saved_mask = 0;
+    cg->pushed_bytes = 0;
+    temp_init(cg);
+
+    /* Pass 1: Compute live intervals and allocate registers */
+    cg_compute_intervals(cg, prog);
+    cg_linear_scan(cg);
+
+    /* Pass 2: Emit code */
+    /* First emit _start */
+    cg_emit_start(cg);
+
+    /* Pre-pass: collect IR_ALLOC sizes before prologue */
+    for (int i = 0; i < prog->count; i++) {
+        if (prog->instrs[i].kind == IR_ALLOC) {
+            int needed = (int)prog->instrs[i].ival;
+            if (needed > cg->frame_size)
+                cg->frame_size = needed;
+        }
+    }
+    cg->frame_size = (cg->frame_size + 15) & ~15;
+
+    /* Resolve the "main" label placeholder before emitting prologue */
+    for (int i = 0; i < cg->label_count; i++) {
+        if (strcmp(cg->labels[i].name, "main") == 0 && cg->labels[i].code_offset < 0) {
+            cg->labels[i].code_offset = (int)cg->code_size;
+            break;
+        }
+    }
+
+    /* Emit prologue */
+    cg_emit_prologue(cg);
+
+    /* Emit all instructions */
+    for (int i = 0; i < prog->count; i++) {
+        IRInstr *inst = &prog->instrs[i];
+        cg_emit_instr(cg, inst);
+    }
+
+    /* If no RET was emitted, add default return */
+    /* Check if last instruction was a RET */
+    int has_ret = 0;
+    for (int i = 0; i < prog->count; i++) {
+        if (prog->instrs[i].kind == IR_RET) {
+            has_ret = 1;
+            break;
+        }
+    }
+    if (!has_ret) {
+        emit_mov_rimm(cg, R_RAX, 0);
+        cg_emit_epilogue(cg);
+    }
+
+    /* Patch branches */
+    /* Ensure "main" label is resolved (may still be -1 if no IR_LABEL was emitted) */
+    for (int i = 0; i < cg->label_count; i++) {
+        if (strcmp(cg->labels[i].name, "main") == 0 && cg->labels[i].code_offset < 0) {
+            cg->labels[i].code_offset = (int)cg->code_size;
+        }
+    }
+    cg_patch_branches(cg);
+    {
+        ElfWriter *elf = elf_create();
+        if (elf) {
+            elf_add_text(elf, cg->code, cg->code_size);
+            elf_add_rodata(elf, cg->rodata, cg->rodata_size);
+            elf->entry = ELF_TEXT_BASE;
+            elf_define_symbol(elf, "_start", ELF_TEXT_BASE);
+            elf_write(elf, cg->output_path);
+            elf_destroy(elf);
+        }
+    }
+
+    return 0;
+}
+
+void x86_64_init(Backend *be, const char *output)
+{
+    (void)be;
+    (void)output;
+}

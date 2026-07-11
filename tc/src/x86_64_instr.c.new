@@ -1,0 +1,718 @@
+/* tc/src/x86_64_instr.c -- IR instruction dispatch and branch patching */
+
+#include "x86_64_instr.h"
+#include "x86_64_emit.h"
+#include "elf.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+
+/* Argument registers for calls */
+static const int ARG_REGS[6] = { R_RDI, R_RSI, R_RDX, R_RCX, R_R8, R_R9 };
+
+int cg_find_label(CodeGen *cg, const char *name)
+{
+    for (int i = 0; i < cg->label_count; i++) {
+        if (strcmp(cg->labels[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+int cg_add_label(CodeGen *cg, const char *name, int offset)
+{
+    if (cg->label_count >= MAX_LABELS) {
+        fprintf(stderr, "Too many labels\n");
+        return -1;
+    }
+    LabelEntry *e = &cg->labels[cg->label_count];
+    snprintf(e->name, sizeof(e->name), "%s", name);
+    e->code_offset = offset;
+    cg->label_count++;
+    return cg->label_count - 1;
+}
+
+int cg_find_global(CodeGen *cg, const char *name)
+{
+    for (int i = 0; i < cg->global_count; i++) {
+        if (strcmp(cg->globals[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+void cg_emit_instr(CodeGen *cg, IRInstr *inst)
+{
+    switch (inst->kind) {
+        /* Data movement */
+        case IR_MOV: {
+            if (inst->temp_id < 0) break;
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            if (dst_reg >= 0) {
+                if (dst_reg != src_reg)
+                    emit_mov_rr(cg, dst_reg, src_reg);
+            } else {
+                /* dst is on stack */
+                if (src_reg != R_RAX)
+                    emit_mov_rr(cg, R_RAX, src_reg);
+                emit_mov_mem_rbp_r(cg, R_RAX, temp_get_stack_off(cg, inst->temp_id));
+            }
+            break;
+        }
+
+        case IR_CONST: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            if (dst_reg >= 0) {
+                emit_mov_rimm(cg, dst_reg, inst->ival);
+            } else {
+                emit_mov_rimm(cg, R_RAX, inst->ival);
+                emit_mov_mem_rbp_r(cg, R_RAX, temp_get_stack_off(cg, inst->temp_id));
+            }
+            break;
+        }
+
+        case IR_ADDR_GLOBAL: {
+            if (inst->temp_id < 0) break;
+            /* lea dst, [rip+disp] - disp to rodata offset */
+            int gidx = cg_find_global(cg, inst->label);
+            int rodata_off = 0;
+            if (gidx >= 0)
+                rodata_off = cg->globals[gidx].rodata_offset;
+            /* disp = rodata_vaddr + rodata_off - (code_vaddr + current_ip + 7) */
+            /* Use ELF constants for correctness: */
+            /*   code lives at ELF_TEXT_BASE, rodata at ELF_RODATA_BASE */
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            if (dst_reg < 0) dst_reg = R_RAX;
+            /* Emit lea with placeholder disp */
+            int lea_start = (int)cg->code_size;
+            emit_lea_r_rip(cg, dst_reg, 0); /* placeholder */
+            /* Record patch: disp = ELF_RODATA_BASE + rodata_off - (ELF_TEXT_BASE + lea_start + 7) */
+            if (cg->patch_count < MAX_PATCHES) {
+                int32_t disp = (int32_t)(ELF_RODATA_BASE + (uint64_t)rodata_off - (ELF_TEXT_BASE + (uint64_t)lea_start + 7));
+                /* Patch at lea_start + 3 (after REX 8D ModR/M) */
+                uint8_t *p = cg->code + lea_start + 3;
+                uint8_t *d = (uint8_t *)&disp;
+                p[0] = d[0]; p[1] = d[1]; p[2] = d[2]; p[3] = d[3];
+                cg->patch_count++; /* dummy entry to not break counting */
+            }
+            /* Store to stack if destination is spilled */
+            if (temp_get_reg(cg, inst->temp_id) < 0) {
+                emit_mov_mem_rbp_r(cg, dst_reg, temp_get_stack_off(cg, inst->temp_id));
+            }
+            break;
+        }
+
+        case IR_ADDR_LOCAL: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            if (dst_reg < 0) dst_reg = R_RAX;
+            emit_lea_r_rbp(cg, dst_reg, (int32_t)inst->ival);
+            /* Store to stack if destination is spilled */
+            if (temp_get_reg(cg, inst->temp_id) < 0) {
+                emit_mov_mem_rbp_r(cg, dst_reg, temp_get_stack_off(cg, inst->temp_id));
+            }
+            break;
+        }
+
+        case IR_LOAD: {
+            if (inst->temp_id < 0) break;
+            /* Load address into rax */
+            int addr_reg = cg_load_temp(cg, inst->src_id);
+            if (addr_reg != R_RAX)
+                emit_mov_rr(cg, R_RAX, addr_reg);
+            /* Load from [rax] */
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            if (dst_reg < 0) dst_reg = R_RAX;
+
+            if (inst->type_size == 8) {
+                emit_mov_r_m(cg, dst_reg);
+            } else if (inst->type_size == 4) {
+                if (inst->is_signed) {
+                    /* movsxd dst, [rax] : REX 63 00|dst */
+                    uint8_t db = (uint8_t)((dst_reg >= 8) ? 1 : 0);
+                    cg_emit_byte(cg, rex_w(db, 0));
+                    cg_emit_byte(cg, 0x63);
+                    cg_emit_byte(cg, (uint8_t)(0x00 | ((dst_reg & 15) << 3)));
+                } else {
+                    /* mov eax, [rax] then zero-extend */
+                    emit_mov_r32_mem(cg, dst_reg, R_RAX);
+                }
+            } else {
+                /* 1-byte */
+                if (inst->is_signed) {
+                    emit_movsx_r64_byte(cg, dst_reg, R_RAX);
+                } else {
+                    emit_movzx_r64_byte(cg, dst_reg, R_RAX);
+                }
+            }
+            /* Store to stack if destination is spilled */
+            if (temp_get_reg(cg, inst->temp_id) < 0) {
+                emit_mov_mem_rbp_r(cg, dst_reg, temp_get_stack_off(cg, inst->temp_id));
+            }
+            break;
+        }
+
+        case IR_STORE: {
+            /* Store src2 to address in src_id */
+            int addr_reg = cg_load_temp(cg, inst->src_id);
+            if (addr_reg != R_RAX)
+                emit_mov_rr(cg, R_RAX, addr_reg);
+            int val_reg = cg_load_temp(cg, inst->src2_id);
+
+            if (inst->type_size == 8) {
+                emit_mov_m_r(cg, val_reg);
+            } else if (inst->type_size == 4) {
+                emit_mov_mem_r32(cg, val_reg, R_RAX);
+            } else {
+                emit_mov_r8_mem(cg, val_reg, R_RAX);
+            }
+            break;
+        }
+
+        case IR_ADDR_PARAM: {
+            if (inst->temp_id < 0) break;
+            /* param at [rbp + 16 + ival*8] */
+            int disp = 16 + (int)inst->ival * 8;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            if (dst_reg < 0) dst_reg = R_RAX;
+            emit_lea_r_rbp(cg, dst_reg, (int32_t)disp);
+            /* Store to stack if destination is spilled */
+            if (temp_get_reg(cg, inst->temp_id) < 0) {
+                emit_mov_mem_rbp_r(cg, dst_reg, temp_get_stack_off(cg, inst->temp_id));
+            }
+            break;
+        }
+
+        /* Arithmetic */
+        case IR_ADD: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            if (dst_reg >= 0) {
+                if (dst_reg == src2_reg) {
+                    /* dst already has src2; add src to it */
+                    if (src_reg != src2_reg)
+                        emit_add_rr(cg, dst_reg, src_reg);
+                } else {
+                    if (dst_reg != src_reg)
+                        emit_mov_rr(cg, dst_reg, src_reg);
+                    emit_add_rr(cg, dst_reg, src2_reg);
+                }
+            } else {
+                if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+                if (R_RAX != src2_reg) emit_add_rr(cg, R_RAX, src2_reg);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        case IR_SUB: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            if (dst_reg >= 0) {
+                if (dst_reg == src2_reg) {
+                    /* dst has src2; need src - src2. Use neg trick:
+                       neg dst (now -src2), add src */
+                    emit_neg_r(cg, dst_reg);
+                    if (dst_reg != src_reg)
+                        emit_add_rr(cg, dst_reg, src_reg);
+                } else {
+                    if (dst_reg != src_reg)
+                        emit_mov_rr(cg, dst_reg, src_reg);
+                    emit_sub_rr(cg, dst_reg, src2_reg);
+                }
+            } else {
+                if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+                if (R_RAX != src2_reg) emit_sub_rr(cg, R_RAX, src2_reg);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        case IR_MUL: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            if (dst_reg >= 0) {
+                if (dst_reg == src2_reg) {
+                    if (src_reg != src2_reg)
+                        emit_imul_rr(cg, dst_reg, src_reg);
+                } else {
+                    if (dst_reg != src_reg)
+                        emit_mov_rr(cg, dst_reg, src_reg);
+                    emit_imul_rr(cg, dst_reg, src2_reg);
+                }
+            } else {
+                if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+                if (R_RAX != src2_reg) emit_imul_rr(cg, R_RAX, src2_reg);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        case IR_DIV: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            /* dividend -> rax */
+            if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+            emit_cqo(cg);
+            /* divisor -> non-rax/rdx reg */
+            if (src2_reg == R_RAX || src2_reg == R_RDX) {
+                emit_mov_rr(cg, R_RCX, src2_reg);
+                src2_reg = R_RCX;
+            }
+            emit_idiv_r(cg, src2_reg);
+            /* result in rax */
+            if (dst_reg >= 0) {
+                if (dst_reg != R_RAX)
+                    emit_mov_rr(cg, dst_reg, R_RAX);
+            } else {
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        case IR_MOD: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+            emit_cqo(cg);
+            if (src2_reg == R_RAX || src2_reg == R_RDX) {
+                emit_mov_rr(cg, R_RCX, src2_reg);
+                src2_reg = R_RCX;
+            }
+            emit_idiv_r(cg, src2_reg);
+            /* remainder in rdx */
+            if (dst_reg >= 0 && dst_reg != R_RDX) {
+                emit_mov_rr(cg, dst_reg, R_RDX);
+            } else if (dst_reg < 0) {
+                /* Store rdx to stack */
+                emit_mov_mem_rbp_r(cg, R_RDX, temp_get_stack_off(cg, inst->temp_id));
+            }
+            break;
+        }
+
+        case IR_BAND: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            if (dst_reg >= 0) {
+                if (dst_reg == src2_reg) {
+                    if (src_reg != src2_reg)
+                        emit_and_rr(cg, dst_reg, src_reg);
+                } else {
+                    if (dst_reg != src_reg) emit_mov_rr(cg, dst_reg, src_reg);
+                    emit_and_rr(cg, dst_reg, src2_reg);
+                }
+            } else {
+                if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+                if (R_RAX != src2_reg) emit_and_rr(cg, R_RAX, src2_reg);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        case IR_BOR: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            if (dst_reg >= 0) {
+                if (dst_reg == src2_reg) {
+                    if (src_reg != src2_reg)
+                        emit_or_rr(cg, dst_reg, src_reg);
+                } else {
+                    if (dst_reg != src_reg) emit_mov_rr(cg, dst_reg, src_reg);
+                    emit_or_rr(cg, dst_reg, src2_reg);
+                }
+            } else {
+                if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+                if (R_RAX != src2_reg) emit_or_rr(cg, R_RAX, src2_reg);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        case IR_XOR: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            if (dst_reg >= 0) {
+                if (dst_reg == src2_reg) {
+                    if (src_reg != src2_reg)
+                        emit_xor_rr(cg, dst_reg, src_reg);
+                } else {
+                    if (dst_reg != src_reg) emit_mov_rr(cg, dst_reg, src_reg);
+                    emit_xor_rr(cg, dst_reg, src2_reg);
+                }
+            } else {
+                if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+                if (R_RAX != src2_reg) emit_xor_rr(cg, R_RAX, src2_reg);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        case IR_SHL: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            /* count must be in cl */
+            if (src2_reg != R_RCX)
+                emit_mov_rr(cg, R_RCX, src2_reg);
+            if (dst_reg >= 0) {
+                if (dst_reg != src_reg) emit_mov_rr(cg, dst_reg, src_reg);
+                emit_shl_rcl(cg, dst_reg);
+            } else {
+                if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+                emit_shl_rcl(cg, R_RAX);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        case IR_SHR: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            if (src2_reg != R_RCX)
+                emit_mov_rr(cg, R_RCX, src2_reg);
+            if (dst_reg >= 0) {
+                if (dst_reg != src_reg) emit_mov_rr(cg, dst_reg, src_reg);
+                if (inst->is_signed)
+                    emit_sar_rcl(cg, dst_reg);
+                else
+                    emit_shr_rcl(cg, dst_reg);
+            } else {
+                if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+                if (inst->is_signed)
+                    emit_sar_rcl(cg, R_RAX);
+                else
+                    emit_shr_rcl(cg, R_RAX);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        /* Unary */
+        case IR_NEG: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            if (dst_reg >= 0) {
+                if (dst_reg != src_reg) emit_mov_rr(cg, dst_reg, src_reg);
+                emit_neg_r(cg, dst_reg);
+            } else {
+                if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+                emit_neg_r(cg, R_RAX);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        case IR_NOT: {
+            /* Logical not: test src, src; setne al; movzx rax, al */
+            if (inst->temp_id < 0) break;
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            emit_test_rr(cg, src_reg, src_reg);
+            emit_setcc(cg, 5); /* setne al */
+            if (dst_reg >= 0) {
+                emit_movzx_r_al(cg, dst_reg);
+            } else {
+                emit_movzx_rax_al(cg);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        case IR_BITNOT: {
+            if (inst->temp_id < 0) break;
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            if (dst_reg >= 0) {
+                if (dst_reg != src_reg) emit_mov_rr(cg, dst_reg, src_reg);
+                emit_not_r(cg, dst_reg);
+            } else {
+                if (src_reg != R_RAX) emit_mov_rr(cg, R_RAX, src_reg);
+                emit_not_r(cg, R_RAX);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        /* Comparisons */
+        case IR_CMP_EQ:
+        case IR_CMP_NEQ:
+        case IR_CMP_LT:
+        case IR_CMP_GT:
+        case IR_CMP_LEQ:
+        case IR_CMP_GEQ: {
+            if (inst->temp_id < 0) break;
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            int src2_reg = cg_load_temp(cg, inst->src2_id);
+            int dst_reg = temp_get_reg(cg, inst->temp_id);
+
+            /* cmp src2, src  => we want src OP src2 */
+            /* cmp r/m, r: cmp src2_reg, src_reg means src_reg - src2_reg */
+            if (src_reg != src2_reg) {
+                emit_cmp_rr(cg, src2_reg, src_reg);
+            } else {
+                emit_xor_rr(cg, src_reg, src_reg); /* zero flags for == check */
+            }
+
+            /* setcc al */
+            int cc = 0;
+            switch (inst->kind) {
+                case IR_CMP_EQ: cc = 0x4; break; /* sete */
+                case IR_CMP_NEQ: cc = 0x5; break; /* setne */
+                case IR_CMP_LT:
+                    cc = inst->is_signed ? 0xC : 0x3; break; /* setl / setb */
+                case IR_CMP_GT:
+                    cc = inst->is_signed ? 0xF : 0x7; break; /* setg / seta */
+                case IR_CMP_LEQ:
+                    cc = inst->is_signed ? 0xE : 0x2; break; /* setle / setbe */
+                case IR_CMP_GEQ:
+                    cc = inst->is_signed ? 0xD : 0x6; break; /* setge / setae */
+                default: cc = 0x4; break;
+            }
+
+            emit_setcc(cg, cc);
+            if (dst_reg >= 0) {
+                emit_movzx_r_al(cg, dst_reg);
+            } else {
+                emit_movzx_rax_al(cg);
+                cg_store_temp(cg, inst->temp_id);
+            }
+            break;
+        }
+
+        /* Control flow */
+        case IR_BR: {
+            /* jmp label */
+            emit_jmp_rel32(cg, 0); /* placeholder */
+            if (cg->patch_count < MAX_PATCHES) {
+                int lbl = cg_find_label(cg, inst->label);
+                if (lbl < 0)
+                    lbl = cg_add_label(cg, inst->label, -1);
+                cg->patches[cg->patch_count].code_offset = (int)cg->code_size - 4;
+                cg->patches[cg->patch_count].target_label_idx = lbl;
+                cg->patches[cg->patch_count].patch_size = 4;
+                cg->patch_count++;
+            }
+            break;
+        }
+
+        case IR_BR_IF: {
+            /* if src != 0 goto label */
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            emit_test_rr(cg, src_reg, src_reg);
+            /* FIX: cc is the OFFSET from 0x80, so jne = 5, not 0x85 */
+            emit_jcc_rel32(cg, 5, 0); /* jne placeholder */
+            if (cg->patch_count < MAX_PATCHES) {
+                int lbl = cg_find_label(cg, inst->label);
+                if (lbl < 0)
+                    lbl = cg_add_label(cg, inst->label, -1);
+                cg->patches[cg->patch_count].code_offset = (int)cg->code_size - 4;
+                cg->patches[cg->patch_count].target_label_idx = lbl;
+                cg->patches[cg->patch_count].patch_size = 4;
+                cg->patch_count++;
+            }
+            break;
+        }
+
+        case IR_BR_IF_NOT: {
+            /* if src == 0 goto label */
+            int src_reg = cg_load_temp(cg, inst->src_id);
+            emit_test_rr(cg, src_reg, src_reg);
+            /* FIX: cc is the OFFSET from 0x80, so je = 4, not 0x84 */
+            emit_jcc_rel32(cg, 4, 0); /* je placeholder */
+            if (cg->patch_count < MAX_PATCHES) {
+                int lbl = cg_find_label(cg, inst->label);
+                if (lbl < 0)
+                    lbl = cg_add_label(cg, inst->label, -1);
+                cg->patches[cg->patch_count].code_offset = (int)cg->code_size - 4;
+                cg->patches[cg->patch_count].target_label_idx = lbl;
+                cg->patches[cg->patch_count].patch_size = 4;
+                cg->patch_count++;
+            }
+            break;
+        }
+
+        case IR_LABEL: {
+            /* Record label at current code offset */
+            int lbl = cg_find_label(cg, inst->label);
+            if (lbl >= 0) {
+                /* Only update if not already set (e.g., _start pre-registered "main") */
+                if (cg->labels[lbl].code_offset < 0) {
+                    cg->labels[lbl].code_offset = (int)cg->code_size;
+                }
+            } else {
+                cg_add_label(cg, inst->label, (int)cg->code_size);
+            }
+            break;
+        }
+
+        /* Functions */
+        case IR_CALL: {
+            /* Call function named in label */
+            /* Save caller-saved registers */
+            cg_save_caller_saved(cg);
+            /* Align stack */
+            cg_emit_call_align(cg);
+
+            /* Place arguments */
+            for (int a = 0; a < inst->arg_count && a < 6; a++) {
+                int arg_reg = cg_load_temp(cg, inst->arg_ids[a]);
+                if (arg_reg != ARG_REGS[a])
+                    emit_mov_rr(cg, ARG_REGS[a], arg_reg);
+            }
+
+            /* call label */
+            emit_call_rel32(cg, 0); /* placeholder */
+            if (cg->patch_count < MAX_PATCHES) {
+                int lbl = cg_find_label(cg, inst->label);
+                if (lbl < 0)
+                    lbl = cg_add_label(cg, inst->label, -1);
+                cg->patches[cg->patch_count].code_offset = (int)cg->code_size - 4;
+                cg->patches[cg->patch_count].target_label_idx = lbl;
+                cg->patches[cg->patch_count].patch_size = 4;
+                cg->patch_count++;
+            }
+
+            /* Unalign stack */
+            cg_emit_call_unalign(cg);
+            /* Restore caller-saved */
+            cg_restore_caller_saved(cg);
+
+            /* Result in rax -> temp */
+            if (inst->temp_id >= 0) {
+                int dst_reg = temp_get_reg(cg, inst->temp_id);
+                if (dst_reg >= 0 && dst_reg != R_RAX) {
+                    emit_mov_rr(cg, dst_reg, R_RAX);
+                } else if (dst_reg < 0) {
+                    cg_store_temp(cg, inst->temp_id);
+                }
+            }
+            break;
+        }
+
+        case IR_CALL_IND: {
+            /* Call function pointer in src_id */
+            cg_save_caller_saved(cg);
+            cg_emit_call_align(cg);
+
+            /* Place arguments */
+            for (int a = 0; a < inst->arg_count && a < 6; a++) {
+                int arg_reg = cg_load_temp(cg, inst->arg_ids[a]);
+                if (arg_reg != ARG_REGS[a])
+                    emit_mov_rr(cg, ARG_REGS[a], arg_reg);
+            }
+
+            /* Move function pointer to rax, call rax */
+            int fn_reg = cg_load_temp(cg, inst->src_id);
+            if (fn_reg != R_RAX)
+                emit_mov_rr(cg, R_RAX, fn_reg);
+            emit_call_rax(cg);
+
+            cg_emit_call_unalign(cg);
+            cg_restore_caller_saved(cg);
+
+            if (inst->temp_id >= 0) {
+                int dst_reg = temp_get_reg(cg, inst->temp_id);
+                if (dst_reg >= 0 && dst_reg != R_RAX) {
+                    emit_mov_rr(cg, dst_reg, R_RAX);
+                } else if (dst_reg < 0) {
+                    cg_store_temp(cg, inst->temp_id);
+                }
+            }
+            break;
+        }
+
+        case IR_PARAM: {
+            /* Record parameter count */
+            int param_n = (int)inst->ival;
+            if (param_n + 1 > cg->param_count)
+                cg->param_count = param_n + 1;
+            break;
+        }
+
+        case IR_RET: {
+            if (inst->src_id >= 0) {
+                int src_reg = cg_load_temp(cg, inst->src_id);
+                if (src_reg != R_RAX)
+                    emit_mov_rr(cg, R_RAX, src_reg);
+            }
+            cg_emit_epilogue(cg);
+            break;
+        }
+
+        /* Memory */
+        case IR_ALLOC:
+            break;  /* frame_size already set by pre-pass */
+
+        case IR_GLOBAL_STR: {
+            /* Emit string to rodata */
+            if (inst->label) {
+                int gidx = cg_find_global(cg, inst->label);
+                if (gidx < 0) {
+                    if (cg->global_count < MAX_GLOBALS) {
+                        size_t len = strlen(inst->label) + 1;
+                        cg_grow_rodata(cg, len);
+                        memcpy(cg->rodata + cg->rodata_size, inst->label, len);
+                        cg->globals[cg->global_count].rodata_offset =
+                            (int)cg->rodata_size;
+                        snprintf(cg->globals[cg->global_count].name,
+                                 sizeof(cg->globals[cg->global_count].name),
+                                 "%s", inst->label);
+                        cg->rodata_size += len;
+                        cg->global_count++;
+                    }
+                }
+            }
+            break;
+        }
+
+        case IR_SYSCALL: {
+            emit_syscall(cg);
+            break;
+        }
+
+        case IR_ARG:
+        case IR_NOP:
+        default:
+            /* No code emitted */
+            break;
+    }
+}
+
+void cg_patch_branches(CodeGen *cg)
+{
+    for (int i = 0; i < cg->patch_count; i++) {
+        BranchPatch *bp = &cg->patches[i];
+        if (bp->target_label_idx < 0) continue; /* skip special patches */
+        int lbl = bp->target_label_idx;
+        if (lbl < 0 || lbl >= cg->label_count) continue;
+        int target = cg->labels[lbl].code_offset;
+        if (target < 0) continue; /* forward ref not resolved yet */
+        int32_t rel = (int32_t)(target - (bp->code_offset + bp->patch_size));
+        uint8_t *p = cg->code + bp->code_offset;
+        uint8_t *d = (uint8_t *)&rel;
+        p[0] = d[0]; p[1] = d[1]; p[2] = d[2]; p[3] = d[3];
+    }
+}

@@ -3,6 +3,7 @@
 #include <string.h>
 
 void backend_init_x86_64(Backend *be, const char *output) {
+    (void)output;
     memset(be, 0, sizeof(*be));
     x86_64_init(be, output);
 }

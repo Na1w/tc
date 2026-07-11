@@ -29,7 +29,7 @@ static char *strdup_name(const char *s)
 }
 
 /* djb2 hash */
-static uint32_t hash_name(const char *name)
+uint32_t hash_name(const char *name)
 {
     uint32_t h = 5381;
     while (*name) {

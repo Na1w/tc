@@ -454,7 +454,9 @@ static int ir_lower_lvalue_addr(IRGen *gen, Node *node)
     if (!name) return -1;
 
     Symbol *sym = sema_lookup(gen->sema, node->u.ident.hash, name);
-    if (sym && sym->kind == SYM_VAR && sym->scope_kind == SCOPE_GLOBAL) {
+    if (sym && sym->kind == SYM_PARAM) {
+        return ir_emit_addr_param(gen->prog, (int)(intptr_t)sym->data);
+    } else if (sym && sym->kind == SYM_VAR && sym->scope_kind == SCOPE_GLOBAL) {
         return ir_emit_addr_global(gen->prog, name);
     } else {
         int off = 0;
@@ -472,11 +474,13 @@ static int ir_lower_ident_load(IRGen *gen, Node *node)
 
     Symbol *sym = sema_lookup(gen->sema, node->u.ident.hash, name);
     int addr_t;
-    if (sym && sym->kind == SYM_VAR && sym->scope_kind == SCOPE_GLOBAL) {
+    if (sym && sym->kind == SYM_PARAM) {
+        addr_t = ir_emit_addr_param(gen->prog, (int)(intptr_t)sym->data);
+    } else if (sym && sym->kind == SYM_VAR && sym->scope_kind == SCOPE_GLOBAL) {
         addr_t = ir_emit_addr_global(gen->prog, name);
     } else {
-        int off = 0;
-        if (sym && sym->data) off = (int)(intptr_t)sym->data;
+        int off = gen->frame_offset;
+        if (sym) off = (int)(intptr_t)sym->data;
         addr_t = ir_emit_addr_local(gen->prog, off);
     }
 
@@ -767,6 +771,40 @@ static int ir_lower_expr(IRGen *gen, Node *node)
             i->src2_id = rv;
             i->temp_id = t;
             i->type_size = ir_type_size(gen->sema, lval_node->type_id);
+
+            /* Store result back to lvalue */
+            int addr_t = -1;
+            if (lval_node->kind == NODE_IDENT) {
+                addr_t = ir_lower_lvalue_addr(gen, lval_node);
+            } else if (lval_node->kind == NODE_INDEX) {
+                int arr_addr = ir_lower_expr(gen, lval_node->u.index.array);
+                int idx_val = ir_lower_expr(gen, lval_node->u.index.index);
+                int elem_size = ir_type_size(gen->sema, lval_node->type_id);
+                int scaled = ir_emit_const(gen->prog, (int64_t)elem_size);
+                int off = ir_gen_new_temp(gen);
+                int iidx = ir_grow(gen->prog);
+                IRInstr *ii = &gen->prog->instrs[iidx];
+                ii->kind = IR_MUL;
+                ii->src_id = idx_val;
+                ii->src2_id = scaled;
+                ii->temp_id = off;
+                ii->type_size = 4;
+                addr_t = ir_gen_new_temp(gen);
+                int aidx = ir_grow(gen->prog);
+                IRInstr *ai = &gen->prog->instrs[aidx];
+                ai->kind = IR_ADD;
+                ai->src_id = arr_addr;
+                ai->src2_id = off;
+                ai->temp_id = addr_t;
+                ai->type_size = 8;
+            } else if (lval_node->kind == NODE_DEREF) {
+                addr_t = ir_lower_expr(gen, lval_node->u.unary.operand);
+            }
+            if (addr_t >= 0) {
+                ir_emit_store(gen->prog, addr_t, t,
+                              ir_type_size(gen->sema, lval_node->type_id),
+                              ir_type_signed(gen->sema, lval_node->type_id));
+            }
             return t;
         }
 
@@ -1183,6 +1221,13 @@ static void ir_lower_stmt(IRGen *gen, Node *node)
         ir_emit_alloc(gen->prog, type_sz);
         gen->frame_offset -= type_sz;
 
+
+        /* Record stack offset in symbol for later loads/stores */
+        {
+            uint32_t vhash = hash_name(node->u.var_decl.name);
+            Symbol *sym = sema_lookup(gen->sema, vhash, node->u.var_decl.name);
+            if (sym) sym->data = (void *)(intptr_t)gen->frame_offset;
+        }
         if (node->u.var_decl.init) {
             int val = ir_lower_expr(gen, node->u.var_decl.init);
             int addr = ir_emit_addr_local(gen->prog, gen->frame_offset);
@@ -1233,6 +1278,13 @@ IRProgram *ir_lower(Node *ast, SemaContext *sema)
                     IRInstr *i = &prog->instrs[idx];
                     i->kind = IR_PARAM;
                     i->ival = (int64_t)p;
+
+                    /* Record parameter index for address lowering */
+                    ParamDecl *pd = &stmt->u.func_decl.params[p];
+                    if (pd->name) {
+                        Symbol *psym = sema_lookup(sema, pd->hash, pd->name);
+                        if (psym) psym->data = (void *)(intptr_t)p;
+                    }
                 }
 
                 gen.frame_offset = 0;

@@ -78,7 +78,7 @@ typedef struct Node {
         struct { int64_t lo; int64_t hi; struct Node *body; } case_stmt;
         struct { struct Node **stmts; int nstmts; } block;
         struct { const char *name; int type_id; struct Node *init; int is_static; } var_decl;
-        struct { const char *name; int ret_type_id; ParamDecl *params; int nparams; struct Node *body; } func_decl;
+        struct { const char *name; int ret_type_id; ParamDecl *params; int nparams; int is_variadic; struct Node *body; } func_decl;
         struct { const char *old_name; const char *new_name; } typedef_node;
         struct { struct Node *type_expr; struct Node *operand; } cast;
         struct { struct Node *operand; } sizeof_node;

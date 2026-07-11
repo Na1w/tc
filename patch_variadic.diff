@@ -1,0 +1,46 @@
+--- a/tc/src/ast.h
++++ b/tc/src/ast.h
+@@ -78,7 +78,7 @@
+         struct { struct Node **stmts; int nstmts; } block;
+         struct { const char *name; int type_id; struct Node *init; int is_static; } var_decl;
+-        struct { const char *name; int ret_type_id; ParamDecl *params; int nparams; struct Node *body; } func_decl;
++        struct { const char *name; int ret_type_id; ParamDecl *params; int nparams; int is_variadic; struct Node *body; } func_decl;
+         struct { const char *old_name; const char *new_name; } typedef_node;
+         struct { struct Node *type_expr; struct Node *operand; } cast;
+         struct { struct Node *operand; } sizeof_node;
+--- a/tc/src/parser.c
++++ b/tc/src/parser.c
+@@ -896,6 +896,7 @@
+         advance(p); /* consume ( */
+         ParamDecl *params = NULL;
+         int nparams = 0;
++        int is_variadic = 0;
+         int pcap = 4;
+         params = (ParamDecl *)malloc(sizeof(ParamDecl) * (size_t)pcap);
+ 
+@@ -905,6 +906,13 @@
+                 if (p->current.kind == TOK_KW_VOID) {
+                     advance(p);
+                     break;
++                }
++                // Check for variadic (...) as the last parameter
++                if (p->current.kind == TOK_ELLIPSIS) {
++                    is_variadic = 1;
++                    advance(p);
++                    break;
+                 }
+                 int param_type = parse_type_spec(p);
+@@ -952,6 +960,7 @@
+             n->u.func_decl.params = params;
+             n->u.func_decl.nparams = nparams;
++            n->u.func_decl.is_variadic = is_variadic;
+             n->u.func_decl.body = body;
+             (void)hash;
+             (void)ptr_stars;
+@@ -970,6 +979,7 @@
+         n->u.func_decl.params = NULL;
+         n->u.func_decl.nparams = 0;
++        n->u.func_decl.is_variadic = is_variadic;
+         n->u.func_decl.body = NULL;
+         (void)hash;
+         (void)ptr_stars;
