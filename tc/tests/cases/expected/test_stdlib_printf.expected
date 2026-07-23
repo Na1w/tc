@@ -1,0 +1,10 @@
+exit_code=0
+stdout=test line
+string test
+42
+-100
+ff
+A
+(nil)
+% done
+Count: 10, Name: test

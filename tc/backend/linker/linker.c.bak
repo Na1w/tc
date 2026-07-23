@@ -1,0 +1,1409 @@
+/*
+ * linker.c -- Minimal ELF64 static linker for the tc C compiler.
+ *
+ * Reads multiple ET_REL object files (.o), resolves symbols, applies
+ * relocations, and produces an ET_EXEC executable.
+ *
+ * Supported relocations: R_X86_64_64, R_X86_64_PC32, R_X86_64_PLT32
+ */
+
+#define _GNU_SOURCE
+
+#include "linker.h"
+#include "elf.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+/* ------------------------------------------------------------------ */
+/*  ELF constants                                                      */
+/* ------------------------------------------------------------------ */
+
+#define EI_NIDENT   16
+#define EI_CLASS    4
+#define EI_DATA     5
+#define EI_VERSION  6
+#define EI_OSABI    7
+
+#define ELFCLASS64  2
+#define ELFDATA2LSB 1
+
+#define ET_REL      1
+#define ET_EXEC     2
+
+#define EM_X86_64   0x3E
+
+#define SHT_NULL        0
+#define SHT_PROGBITS    1
+#define SHT_SYMTAB      2
+#define SHT_STRTAB      3
+#define SHT_RELA        4
+#define SHT_NOBITS      8
+
+#define SHF_WRITE       0x1
+#define SHF_ALLOC       0x2
+#define SHF_EXECINSTR   0x4
+
+#define STB_LOCAL       0
+#define STB_GLOBAL      1
+#define STB_WEAK        2
+
+#define STT_NOTYPE      0
+#define STT_OBJECT      1
+#define STT_FUNC        2
+#define STT_SECTION     3
+#define STT_FILE        4
+
+#define SHN_UNDEF       0
+#define SHN_ABS         0xFF1U
+
+#define R_X86_64_NONE       0
+#define R_X86_64_64         1
+#define R_X86_64_PC32       2
+#define R_X86_64_GOT32      3
+#define R_X86_64_PLT32      4
+#define R_X86_64_32         10
+#define R_X86_64_32S        11
+#define R_X86_64_GLOB_DAT   6
+#define R_X86_64_JUMP_SLOT  7
+#define R_X86_64_RELATIVE   8
+
+#define PT_LOAD   1
+#define PF_R      0x4
+#define PF_W      0x2
+#define PF_X      0x1
+
+/* ------------------------------------------------------------------ */
+/*  Packed ELF structures                                              */
+/* ------------------------------------------------------------------ */
+
+#pragma pack(push, 1)
+
+typedef struct {
+    unsigned char e_ident[EI_NIDENT];
+    uint16_t      e_type;
+    uint16_t      e_machine;
+    uint32_t      e_version;
+    uint64_t      e_entry;
+    uint64_t      e_phoff;
+    uint64_t      e_shoff;
+    uint32_t      e_flags;
+    uint16_t      e_ehsize;
+    uint16_t      e_phentsize;
+    uint16_t      e_phnum;
+    uint16_t      e_shentsize;
+    uint16_t      e_shnum;
+    uint16_t      e_shstrndx;
+} Elf64_Ehdr;
+
+typedef struct {
+    uint32_t  sh_name;
+    uint32_t  sh_type;
+    uint64_t  sh_flags;
+    uint64_t  sh_addr;
+    uint64_t  sh_offset;
+    uint64_t  sh_size;
+    uint32_t  sh_link;
+    uint32_t  sh_info;
+    uint64_t  sh_addralign;
+    uint64_t  sh_entsize;
+} Elf64_Shdr;
+
+typedef struct {
+    uint32_t  p_type;
+    uint32_t  p_flags;
+    uint64_t  p_offset;
+    uint64_t  p_vaddr;
+    uint64_t  p_paddr;
+    uint64_t  p_filesz;
+    uint64_t  p_memsz;
+    uint64_t  p_align;
+} Elf64_Phdr;
+
+typedef struct {
+    uint32_t  st_name;
+    uint8_t   st_info;
+    uint8_t   st_other;
+    uint16_t  st_shndx;
+    uint64_t  st_value;
+    uint64_t  st_size;
+} Elf64_Sym;
+
+typedef struct {
+    uint64_t  r_offset;
+    uint64_t  r_info;
+    int64_t   r_addend;
+} Elf64_Rela;
+
+#pragma pack(pop)
+
+/* ------------------------------------------------------------------ */
+/*  Internal data structures                                           */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    char            name[64];
+    uint32_t        type;
+    uint64_t        flags;
+    uint64_t        offset;
+    uint64_t        size;
+    uint64_t        vaddr;
+    unsigned char  *data;
+} LkSection;
+
+typedef struct {
+    char            name[256];
+    uint8_t         bind;
+    uint8_t         type;
+    uint16_t        shndx;
+    uint64_t        value;
+    uint64_t        size;
+    int             is_extern;
+    int             obj_idx;
+    int             sec_idx;
+    uint64_t        final_addr;
+} LkSymbol;
+
+typedef struct {
+    char            path[512];
+    unsigned char  *data;
+    size_t          size;
+    Elf64_Ehdr     *ehdr;
+    Elf64_Shdr     *shdrs;
+    int             shdr_count;
+    LkSection      *sections;
+    int             section_count;
+    LkSymbol       *symbols;
+    int             symbol_count;
+    int           *local_to_global;
+} LkObject;
+
+struct Linker {
+    LkObject      *objects;
+    int            obj_count;
+    size_t         obj_cap;
+
+    LkSymbol      *gsyms;
+    int            gsym_count;
+    size_t         gsym_cap;
+
+    unsigned char *text_data;
+    size_t         text_size;
+    size_t         text_cap;
+
+    unsigned char *rodata_data;
+    size_t         rodata_size;
+    size_t         rodata_cap;
+
+    unsigned char *data_data;
+    size_t         data_size;
+    size_t         data_cap;
+
+    size_t         bss_size;
+
+    uint64_t       text_base;
+    uint64_t       rodata_base;
+    uint64_t       data_base;
+    uint64_t       bss_base;
+
+    char           entry_name[256];
+    char           error[512];
+};
+
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
+
+static void lk_error(Linker *lk, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(lk->error, sizeof(lk->error), fmt, ap);
+    va_end(ap);
+}
+
+static void *grow(void **buf, size_t *cap, size_t need, size_t elem)
+{
+    if (need <= *cap) return *buf;
+    size_t nc = *cap ? *cap * 2 : 16;
+    while (nc < need) nc *= 2;
+    *buf = realloc(*buf, nc * elem);
+    *cap = nc;
+    return *buf;
+}
+
+static uint8_t  ELF_STB_BIND(uint8_t info)  { return info >> 4; }
+static uint8_t  ELF_STT_TYPE(uint8_t info)  { return info & 0xF; }
+static uint32_t ELF_R_SYM(uint64_t info)    { return (uint32_t)(info >> 32); }
+static uint32_t ELF_R_TYPE(uint64_t info)   { return (uint32_t)(info & 0xFFFFFFFF); }
+
+static const char *strtab_str(const unsigned char *strtab, uint32_t offset)
+{
+    return (const char *)(strtab + offset);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Read an ELF object file                                            */
+/* ------------------------------------------------------------------ */
+
+static LkObject *read_object(Linker *lk, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        lk_error(lk, "Cannot open object file: %s", path);
+        return NULL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    unsigned char *data = malloc((size_t)fsize);
+    if (!data) { fclose(f); return NULL; }
+    if ((long)fread(data, 1, (size_t)fsize, f) != fsize) {
+        free(data); fclose(f);
+        lk_error(lk, "Cannot read object file: %s", path);
+        return NULL;
+    }
+    fclose(f);
+
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)data;
+    if (ehdr->e_ident[0] != 0x7f || ehdr->e_ident[1] != 'E' ||
+        ehdr->e_ident[2] != 'L' || ehdr->e_ident[3] != 'F') {
+        free(data);
+        lk_error(lk, "Not an ELF file: %s", path);
+        return NULL;
+    }
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+        free(data);
+        lk_error(lk, "Not an ELF64 file: %s", path);
+        return NULL;
+    }
+    if (ehdr->e_type != ET_REL) {
+        free(data);
+        lk_error(lk, "Not an ET_REL object: %s", path);
+        return NULL;
+    }
+    if (ehdr->e_machine != EM_X86_64) {
+        free(data);
+        lk_error(lk, "Not an x86-64 object: %s", path);
+        return NULL;
+    }
+
+    Elf64_Shdr *shdrs = (Elf64_Shdr *)(data + ehdr->e_shoff);
+
+    const unsigned char *shstrtab = NULL;
+    if (ehdr->e_shstrndx > 0 && ehdr->e_shstrndx < ehdr->e_shnum) {
+        Elf64_Shdr *shstr = &shdrs[ehdr->e_shstrndx];
+        shstrtab = data + shstr->sh_offset;
+    }
+
+    int sec_count = (int)ehdr->e_shnum;
+    LkSection *sections = calloc((size_t)sec_count, sizeof(LkSection));
+    for (int i = 1; i < sec_count; i++) {
+        Elf64_Shdr *sh = &shdrs[i];
+        LkSection *sec = &sections[i];
+        sec->type = sh->sh_type;
+        sec->flags = sh->sh_flags;
+        sec->offset = sh->sh_offset;
+        sec->size = sh->sh_size;
+
+        if (shstrtab && sh->sh_name > 0) {
+            strncpy(sec->name, strtab_str(shstrtab, sh->sh_name),
+                    sizeof(sec->name) - 1);
+            sec->name[sizeof(sec->name) - 1] = '\0';
+        }
+
+        if (sh->sh_type != SHT_NOBITS && sh->sh_size > 0) {
+            sec->data = (unsigned char *)(data + sh->sh_offset);
+        }
+    }
+
+    /* Parse symbol table (.symtab). */
+    int sym_count = 0;
+    LkSymbol *symbols = NULL;
+    size_t sym_cap = 0;
+    for (int i = 1; i < sec_count; i++) {
+        Elf64_Shdr *sh = &shdrs[i];
+        if (sh->sh_type != SHT_SYMTAB) continue;
+
+        const unsigned char *symstr = NULL;
+        if (sh->sh_link < ehdr->e_shnum) {
+            Elf64_Shdr *ssh = &shdrs[sh->sh_link];
+            symstr = data + ssh->sh_offset;
+        }
+
+        int nsyms = (int)(sh->sh_size / sh->sh_entsize);
+        Elf64_Sym *syms = (Elf64_Sym *)(data + sh->sh_offset);
+
+        for (int j = 0; j < nsyms; j++) {
+            Elf64_Sym *sym = &syms[j];
+            grow((void **)&symbols, &sym_cap,
+                 (size_t)sym_count + 1, sizeof(LkSymbol));
+            LkSymbol *s = &symbols[sym_count++];
+            memset(s, 0, sizeof(*s));
+            if (symstr && sym->st_name > 0) {
+                strncpy(s->name, strtab_str(symstr, sym->st_name),
+                        sizeof(s->name) - 1);
+            }
+            s->bind   = ELF_STB_BIND(sym->st_info);
+            s->type   = ELF_STT_TYPE(sym->st_info);
+            s->shndx  = sym->st_shndx;
+            s->value  = sym->st_value;
+            s->size   = sym->st_size;
+            s->is_extern = (sym->st_shndx == SHN_UNDEF);
+            s->sec_idx = sym->st_shndx;
+        }
+        break;
+    }
+
+    LkObject *obj = calloc(1, sizeof(LkObject));
+    strncpy(obj->path, path, sizeof(obj->path) - 1);
+    obj->data          = data;
+    obj->size          = (size_t)fsize;
+    obj->ehdr          = ehdr;
+    obj->shdrs         = shdrs;
+    obj->shdr_count    = sec_count;
+    obj->sections      = sections;
+    obj->section_count = sec_count;
+    obj->symbols       = symbols;
+    obj->symbol_count  = sym_count;
+
+    return obj;
+}
+
+/* ------------------------------------------------------------------ */
+/*  API: create / destroy                                              */
+/* ------------------------------------------------------------------ */
+
+Linker *linker_create(void)
+{
+    Linker *lk = calloc(1, sizeof(*lk));
+    if (!lk) return NULL;
+    lk->text_base   = ELF_TEXT_BASE;
+    lk->rodata_base = ELF_RODATA_BASE;
+    lk->data_base   = 0x600000;
+    lk->bss_base    = 0x601000;
+    strncpy(lk->entry_name, "main", sizeof(lk->entry_name) - 1);
+    return lk;
+}
+
+void linker_destroy(Linker *lk)
+{
+    if (!lk) return;
+    for (int i = 0; i < lk->obj_count; i++) {
+        free(lk->objects[i].data);
+        free(lk->objects[i].sections);
+        free(lk->objects[i].symbols);
+        free(lk->objects[i].local_to_global);
+    }
+    free(lk->objects);
+    free(lk->gsyms);
+    free(lk->text_data);
+    free(lk->rodata_data);
+    free(lk->data_data);
+    free(lk);
+}
+
+/* ------------------------------------------------------------------ */
+/*  API: add object                                                    */
+/* ------------------------------------------------------------------ */
+
+int linker_add_object(Linker *lk, const char *path)
+{
+    LkObject *obj = read_object(lk, path);
+    if (!obj) return -1;
+
+    grow((void **)&lk->objects, &lk->obj_cap,
+         (size_t)lk->obj_count + 1, sizeof(LkObject));
+    lk->objects[lk->obj_count++] = *obj;
+    free(obj);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  API: add archive (.a)                                              */
+/* ------------------------------------------------------------------ */
+
+/* ARM/COFF archive: simple parser for ar(1) format.
+ * Format: "!<arch>\n" followed by file entries.
+ * Each entry has a 60-byte header:
+ *   name[16], date[12], owner[6], group[6], mode[8], size[10], magic[2]
+ * Followed by file data (padded to even boundary).
+ */
+int linker_add_archive(Linker *lk, const char *path)
+{
+    fprintf(stderr, "tc: trying to open archive: %s\n", path);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        lk_error(lk, "Cannot open archive: %s", path);
+        return -1;
+    }
+    fprintf(stderr, "tc: archive opened successfully\n");
+
+    /* Check magic */
+    char magic[8];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "!<arch>\n", 8) != 0) {
+        fclose(f);
+        lk_error(lk, "Not a valid archive: %s", path);
+        return -1;
+    }
+    fprintf(stderr, "tc: archive magic OK\n");
+
+    char tmpdir[] = "/tmp/tc_archive_XXXXXX";
+    if (mkdtemp(tmpdir) == NULL) {
+        fclose(f);
+        lk_error(lk, "Cannot create temp directory");
+        return -1;
+    }
+
+    /* BSD ar long-name table support */
+    char *long_name_table = NULL;
+    int  long_name_table_size = 0;
+
+    int success = 0;
+    int entry_count = 0;
+
+    while (1) {
+        /* Read 60-byte archive entry header */
+        char header[60];
+        if (fread(header, 1, 60, f) != 60) break;
+
+        /* Parse raw 16-byte name field */
+        char raw_name[17] = {0};
+        int raw_name_len = 0;
+        for (int i = 0; i < 16; i++) {
+            if (header[i] == '\0' || header[i] == ' ') break;
+            raw_name_len++;
+        }
+        memcpy(raw_name, header, raw_name_len);
+        raw_name[raw_name_len] = '\0';
+
+        /* Parse size (bytes 48-58) */
+        char size_str[11];
+        memcpy(size_str, header + 48, 10);
+        size_str[10] = '\0';
+        long file_size = atol(size_str);
+
+        /* Determine effective filename and skip type */
+        char effective_name[256] = {0};
+        int skip_entry = 0;
+
+        if (raw_name_len == 1 && raw_name[0] == '/') {
+            /* SYSV global symbol table - skip */
+            skip_entry = 1;
+        } else if (raw_name_len >= 2 && raw_name[0] == '/' && raw_name[1] == '/') {
+            /* BSD ar long-name string table */
+            if (file_size > 0) {
+                long_name_table = malloc((size_t)file_size + 1);
+                if (long_name_table) {
+                    if ((long)fread(long_name_table, 1, (size_t)file_size, f) == file_size) {
+                        long_name_table[file_size] = '\0';
+                        long_name_table_size = (int)file_size;
+                    } else {
+                        free(long_name_table);
+                        long_name_table = NULL;
+                    }
+                }
+                if (file_size % 2 != 0) fseek(f, 1, SEEK_CUR);
+            }
+            continue;
+        } else if (raw_name_len > 1 && raw_name[0] == '/') {
+            /* BSD ar long-name reference: "/NNN" */
+            int idx = atoi(raw_name + 1);
+            if (long_name_table != NULL && idx >= 0 && idx < long_name_table_size) {
+                const char *p = long_name_table;
+                /* BSD ar long-name table is newline-separated */
+                for (int i = 0; i < idx; i++) {
+                    while (*p != '\0' && *p != '\n') p++;
+                    if (*p != '\0') p++; /* skip newline */
+                }
+                int copy_len = 0;
+                while (p[copy_len] != '\0' && p[copy_len] != '\n')
+                    copy_len++;
+                while (copy_len > 0 && p[copy_len - 1] == '/')
+                    copy_len--;
+                if (copy_len > 0 && (size_t)copy_len < sizeof(effective_name)) {
+                    memcpy(effective_name, p, copy_len);
+                    effective_name[copy_len] = '\0';
+                }
+            }
+        } else {
+            /* Normal filename - strip trailing '/' from BSD ar */
+            int nlen = raw_name_len;
+            while (nlen > 0 && raw_name[nlen - 1] == '/')
+                nlen--;
+            if (nlen > 0 && (size_t)nlen < sizeof(effective_name)) {
+                memcpy(effective_name, raw_name, nlen);
+                effective_name[nlen] = '\0';
+            }
+        }
+
+        /* Skip special entries */
+        if (skip_entry) {
+            if (file_size > 0) {
+                fseek(f, file_size, SEEK_CUR);
+                if (file_size % 2 != 0) fseek(f, 1, SEEK_CUR);
+            }
+            continue;
+        }
+
+        if (file_size <= 0 || effective_name[0] == '\0') {
+            if (file_size > 0) {
+                fseek(f, file_size, SEEK_CUR);
+                if (file_size % 2 != 0) fseek(f, 1, SEEK_CUR);
+            }
+            continue;
+        }
+
+        /* Extract .o file to temp directory */
+        char tmp_path[512];
+        snprintf(tmp_path, sizeof(tmp_path), "%s/%s", tmpdir, effective_name);
+
+        FILE *of = fopen(tmp_path, "wb");
+        if (!of) {
+            if (file_size > 0) {
+                fseek(f, file_size, SEEK_CUR);
+                if (file_size % 2 != 0) fseek(f, 1, SEEK_CUR);
+            }
+            continue;
+        }
+
+        /* Read file data */
+        char *buf = malloc((size_t)file_size);
+        if (buf) {
+            size_t nread = fread(buf, 1, (size_t)file_size, f);
+            if (nread == (size_t)file_size) {
+                fwrite(buf, 1, nread, of);
+            }
+            free(buf);
+        }
+        fclose(of);
+
+        /* Skip padding (ar entries are padded to even boundary) */
+        if (file_size % 2 != 0) fseek(f, 1, SEEK_CUR);
+
+        /* Try to add as object file */
+        if (linker_add_object(lk, tmp_path) == 0) {
+            entry_count++;
+        }
+
+        /* Clean up temp file */
+        unlink(tmp_path);
+    }
+
+    free(long_name_table);
+    fclose(f);
+    rmdir(tmpdir);
+
+    if (entry_count == 0) {
+        lk_error(lk, "No valid object files in archive: %s", path);
+        return -1;
+    }
+
+    success = 1;
+    (void)success;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  API: set entry / base                                              */
+/* ------------------------------------------------------------------ */
+
+void linker_set_entry(Linker *lk, const char *symbol)
+{
+    strncpy(lk->entry_name, symbol, sizeof(lk->entry_name) - 1);
+}
+
+void linker_set_base(Linker *lk, uint64_t text_base)
+{
+    lk->text_base   = text_base;
+    lk->rodata_base = ELF_RODATA_BASE;
+    lk->data_base   = 0x600000;
+    lk->bss_base    = 0x601000;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Merge sections                                                     */
+/* ------------------------------------------------------------------ */
+
+static void merge_sections(Linker *lk)
+{
+    for (int i = 0; i < lk->obj_count; i++) {
+        LkObject *obj = &lk->objects[i];
+
+        for (int j = 1; j < obj->section_count; j++) {
+            LkSection *sec = &obj->sections[j];
+            if (sec->type == SHT_NULL || sec->type == SHT_SYMTAB ||
+                sec->type == SHT_STRTAB || sec->type == SHT_RELA)
+                continue;
+
+            if (strcmp(sec->name, ".text") == 0) {
+                if (lk->text_size + sec->size > lk->text_cap) {
+                    lk->text_cap = (lk->text_size + sec->size) * 2;
+                    lk->text_data = realloc(lk->text_data, lk->text_cap);
+                }
+                if (sec->data && sec->size > 0)
+                    memcpy(lk->text_data + lk->text_size,
+                           sec->data, sec->size);
+                sec->vaddr = lk->text_base + lk->text_size;
+                lk->text_size += sec->size;
+            }
+            else if (strcmp(sec->name, ".rodata") == 0) {
+                if (lk->rodata_size + sec->size > lk->rodata_cap) {
+                    lk->rodata_cap = (lk->rodata_size + sec->size) * 2;
+                    lk->rodata_data = realloc(lk->rodata_data,
+                                              lk->rodata_cap);
+                }
+                if (sec->data && sec->size > 0)
+                    memcpy(lk->rodata_data + lk->rodata_size,
+                           sec->data, sec->size);
+                sec->vaddr = lk->rodata_base + lk->rodata_size;
+                lk->rodata_size += sec->size;
+            }
+            else if (strcmp(sec->name, ".data") == 0 ||
+                     strcmp(sec->name, ".data.rel.local") == 0 ||
+                     strncmp(sec->name, ".data.", 6) == 0) {
+                if (lk->data_size + sec->size > lk->data_cap) {
+                    lk->data_cap = (lk->data_size + sec->size) * 2;
+                    lk->data_data = realloc(lk->data_data, lk->data_cap);
+                }
+                if (sec->data && sec->size > 0)
+                    memcpy(lk->data_data + lk->data_size,
+                           sec->data, sec->size);
+                sec->vaddr = lk->data_base + lk->data_size;
+                lk->data_size += sec->size;
+            }
+            else if (strcmp(sec->name, ".bss") == 0) {
+                sec->vaddr = lk->bss_base + lk->bss_size;
+                lk->bss_size += sec->size;
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Build global symbol table                                          */
+/* ------------------------------------------------------------------ */
+
+static void build_global_symbols(Linker *lk)
+{
+    for (int i = 0; i < lk->obj_count; i++) {
+        LkObject *obj = &lk->objects[i];
+
+        obj->local_to_global = calloc(
+            (size_t)obj->symbol_count, sizeof(int));
+
+        for (int j = 0; j < obj->symbol_count; j++) {
+            LkSymbol *src = &obj->symbols[j];
+
+            if (src->type == STT_FILE) {
+                obj->local_to_global[j] = -1;
+                continue;
+            }
+
+            if (!src->name[0]) {
+                if (src->type == STT_SECTION &&
+                    src->shndx < obj->section_count) {
+                    LkSection *sec = &obj->sections[src->shndx];
+                    if (sec->name[0]) {
+                        snprintf(src->name, sizeof(src->name),
+                                 "%s", sec->name);
+                    } else {
+                        obj->local_to_global[j] = -1;
+                        continue;
+                    }
+                } else {
+                    obj->local_to_global[j] = -1;
+                    continue;
+                }
+            }
+
+            grow((void **)&lk->gsyms, &lk->gsym_cap,
+                 (size_t)lk->gsym_count + 1, sizeof(LkSymbol));
+            LkSymbol *g = &lk->gsyms[lk->gsym_count++];
+            memcpy(g, src, sizeof(LkSymbol));
+            g->obj_idx    = i;
+            g->final_addr = 0;
+
+            obj->local_to_global[j] = lk->gsym_count - 1;
+        }
+    }
+
+    /* Resolve defined symbols to final addresses. */
+    for (int i = 0; i < lk->gsym_count; i++) {
+        LkSymbol *g = &lk->gsyms[i];
+        if (g->is_extern) continue;
+        if (g->shndx == SHN_ABS) {
+            g->final_addr = g->value;
+            continue;
+        }
+
+        LkObject *obj = &lk->objects[g->obj_idx];
+        if (g->sec_idx < obj->section_count) {
+            LkSection *sec = &obj->sections[g->sec_idx];
+            g->final_addr = sec->vaddr + g->value;
+        }
+    }
+
+    /* Resolve undefined symbols to defined ones. */
+    for (int i = 0; i < lk->gsym_count; i++) {
+        LkSymbol *g = &lk->gsyms[i];
+        if (!g->is_extern) continue;
+
+        for (int j = 0; j < lk->gsym_count; j++) {
+            if (i == j) continue;
+            LkSymbol *def = &lk->gsyms[j];
+            if (def->is_extern) continue;
+            if (strcmp(g->name, def->name) == 0) {
+                g->final_addr = def->final_addr;
+                g->is_extern  = 0;
+                g->type       = def->type;
+                break;
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Apply relocations                                                  */
+/* ------------------------------------------------------------------ */
+
+static int apply_relocations(Linker *lk)
+{
+    for (int i = 0; i < lk->obj_count; i++) {
+        LkObject *obj = &lk->objects[i];
+
+        for (int j = 1; j < obj->section_count; j++) {
+            LkSection *sec = &obj->sections[j];
+            if (sec->type != SHT_RELA) continue;
+
+            Elf64_Shdr *sh = &obj->shdrs[j];
+            int target_sec_idx = (int)sh->sh_info;
+            if (target_sec_idx >= obj->section_count) continue;
+            LkSection *target = &obj->sections[target_sec_idx];
+
+            unsigned char *out_buf = NULL;
+            uint64_t       out_buf_start = 0;
+
+            if (strcmp(target->name, ".text") == 0) {
+                out_buf       = lk->text_data;
+                out_buf_start = lk->text_base;
+            } else if (strcmp(target->name, ".rodata") == 0) {
+                out_buf       = lk->rodata_data;
+                out_buf_start = lk->rodata_base;
+            } else if (strcmp(target->name, ".data") == 0 ||
+                       strcmp(target->name, ".data.rel.local") == 0 ||
+                       strncmp(target->name, ".data.", 6) == 0) {
+                out_buf       = lk->data_data;
+                out_buf_start = lk->data_base;
+            } else {
+                continue;
+            }
+
+            uint64_t buf_offset = target->vaddr - out_buf_start;
+
+            Elf64_Rela *relas = (Elf64_Rela *)(obj->data + sec->offset);
+            int nrelas = (int)(sec->size / sizeof(Elf64_Rela));
+
+            for (int r = 0; r < nrelas; r++) {
+                Elf64_Rela *rela = &relas[r];
+                uint32_t local_sym_idx = ELF_R_SYM(rela->r_info);
+                uint32_t rel_type      = ELF_R_TYPE(rela->r_info);
+
+                int global_idx = -1;
+                if (local_sym_idx < (uint32_t)obj->symbol_count) {
+                    global_idx = obj->local_to_global[local_sym_idx];
+                }
+
+                LkSymbol *gsym = NULL;
+                if (global_idx >= 0 && global_idx < lk->gsym_count) {
+                    gsym = &lk->gsyms[global_idx];
+                }
+
+                uint64_t S = 0;
+                if (gsym) S = gsym->final_addr;
+
+                int64_t   A = rela->r_addend;
+                uint64_t  P = target->vaddr + rela->r_offset;
+
+                switch (rel_type) {
+                case R_X86_64_64: {
+                    uint64_t result = S + (uint64_t)A;
+                    if (out_buf)
+                        memcpy(out_buf + buf_offset + rela->r_offset,
+                               &result, 8);
+                    break;
+                }
+                case R_X86_64_PC32:
+                case R_X86_64_PLT32: {
+                    int32_t result = (int32_t)(S + A - P);
+                    if (out_buf)
+                        memcpy(out_buf + buf_offset + rela->r_offset,
+                               &result, 4);
+                    break;
+                }
+                case R_X86_64_32:
+                case R_X86_64_32S: {
+                    uint32_t result = (uint32_t)(S + (uint64_t)A);
+                    if (out_buf)
+                        memcpy(out_buf + buf_offset + rela->r_offset,
+                               &result, 4);
+                    break;
+                }
+                case R_X86_64_RELATIVE: {
+                    uint64_t addr = (uint64_t)S + (uint64_t)A;
+                    if (out_buf)
+                        memcpy(out_buf + buf_offset + rela->r_offset,
+                               &addr, 8);
+                    break;
+                }
+                case R_X86_64_GLOB_DAT:
+                case R_X86_64_JUMP_SLOT: {
+                    uint64_t result = S;
+                    if (out_buf)
+                        memcpy(out_buf + buf_offset + rela->r_offset,
+                               &result, 8);
+                    break;
+                }
+                case R_X86_64_NONE:
+                    break;
+                default:
+                    fprintf(stderr,
+                            "linker: unsupported relocation %u "
+                            "at off 0x%lx in %s\n",
+                            rel_type, (long)rela->r_offset,
+                            target->name);
+                    break;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Emit minimal _start stub (raw x86-64 machine code)                */
+/* ------------------------------------------------------------------ */
+
+static void emit_start_stub(Linker *lk, uint64_t main_addr)
+{
+    /*
+     * _start:
+     *   endbr64                  ; CET entry point marker
+     *   and    $-16, %rsp        ; align stack to 16 bytes
+     *   mov    (%rsp), %rdi      ; argc from kernel stack
+     *   lea    8(%rsp), %rsi     ; argv from kernel stack
+     *   call   main              ; PC-relative call
+     *   mov    %eax, %edi        ; exit code = main's return
+     *   mov    $231, %eax        ; sys_exit_group
+     *   syscall
+     *
+     * Offset  Bytes               Instruction
+     * 0       f3 0f 1e fa          endbr64 (4)
+     * 4       48 83 e4 f0          and $-16,%rsp (4)
+     * 8       48 8b 3c 24          mov (%rsp),%rdi (4)
+     * 12      48 8d 74 24 08       lea 8(%rsp),%rsi (5)
+     * 17      e8 XX XX XX XX       call main (5)
+     * 22      89 c7                mov %eax,%edi (2)
+     * 24      b8 e7 00 00 00       mov $231,%eax (5)
+     * 29      0f 05                syscall (2)
+     */
+    unsigned char code[] = {
+        0xf3, 0x0f, 0x1e, 0xfa,              /* endbr64 */
+        0x48, 0x83, 0xe4, 0xf0,              /* and $-16,%rsp */
+        0x48, 0x8b, 0x3c, 0x24,              /* mov (%rsp),%rdi */
+        0x48, 0x8d, 0x74, 0x24, 0x08,        /* lea 8(%rsp),%rsi */
+        0xe8, 0x00, 0x00, 0x00, 0x00,        /* call main */
+        0x89, 0xc7,                           /* mov %eax,%edi */
+        0xb8, 0xe7, 0x00, 0x00, 0x00,        /* mov $231,%eax */
+        0x0f, 0x05,                           /* syscall */
+    };
+
+    size_t code_size = sizeof(code); /* 31 bytes */
+
+    /* Calculate call offset: target - (call_site + 5).
+     * After prepending, main will be shifted by code_size. */
+    uint64_t call_next = lk->text_base + 22;
+    int32_t call_offset = (int32_t)(main_addr + code_size - call_next);
+    memcpy(code + 18, &call_offset, 4);
+
+    /* Prepend stub to .text. */
+    unsigned char *new_text = malloc(lk->text_size + code_size);
+    memcpy(new_text + code_size, lk->text_data, lk->text_size);
+    memcpy(new_text, code, code_size);
+    free(lk->text_data);
+    lk->text_data = new_text;
+    lk->text_size += code_size;
+
+    /* Shift .text section vaddrs by code_size. */
+    for (int i = 0; i < lk->obj_count; i++) {
+        LkObject *obj = &lk->objects[i];
+        for (int j = 1; j < obj->section_count; j++) {
+            LkSection *sec = &obj->sections[j];
+            if (strcmp(sec->name, ".text") == 0) {
+                sec->vaddr += code_size;
+            }
+        }
+    }
+
+    /* Fix up RIP-relative displacements in user code (shifted by code_size).
+     * Scan for x86-64 RIP-relative memory operands and subtract code_size from
+     * their 32-bit signed displacement. Call/jmp/jcc are handled by PC32 relocations. */
+    {
+        size_t user_code_start = code_size;
+        size_t user_code_size = lk->text_size - code_size;
+        unsigned char *code = lk->text_data + user_code_start;
+        size_t pos = 0;
+        while (pos + 4 <= user_code_size) {
+            unsigned char b = code[pos];
+            int has_rex_b = 0;
+            (void)has_rex_b; /* reserved for future REX.B-aware patching */
+
+            /* Check for REX prefix (0x40-0x4f) */
+            if (b >= 0x40 && b <= 0x4f) {
+                has_rex_b = (b & 0x04) != 0;
+                pos++;
+                if (pos + 4 > user_code_size) break;
+                b = code[pos];
+            }
+
+            /* Skip push/pop (0x50-0x5f) - single byte, no ModR/M */
+            if (b >= 0x50 && b <= 0x5f) {
+                pos++;
+                continue;
+            }
+
+            /* Skip call/jmp/jcc - handled by PC32 relocations */
+            if (b == 0xe8 || b == 0xe9) {
+                pos += 6;
+                continue;
+            }
+            if (b == 0x0f) {
+                if (pos + 5 <= user_code_size) {
+                    unsigned char b2 = code[pos + 1];
+                    if (b2 >= 0x80 && b2 <= 0x8f) {
+                        pos += 7;
+                        continue;
+                    }
+                }
+                pos++;
+                continue;
+            }
+
+            /* Check for RIP-relative memory operand (mod=00, r/m=101) */
+            if (pos + 5 <= user_code_size) {
+                unsigned char modrm = code[pos + 1];
+                unsigned char mod = (modrm >> 6) & 3;
+                unsigned char rm = modrm & 7;
+                if (mod == 0 && rm == 5) {
+                    /* RIP-relative with disp32 (no SIB) */
+                    int32_t *disp = (int32_t *)(code + pos + 2);
+                    *disp -= (int32_t)code_size;
+                    pos += 6;
+                    continue;
+                }
+            }
+
+            /* Check for SIB-based RIP-relative (mod=00, r/m=100, SIB base=101) */
+            if (pos + 6 <= user_code_size) {
+                unsigned char modrm = code[pos + 1];
+                unsigned char mod = (modrm >> 6) & 3;
+                unsigned char rm = modrm & 7;
+                /* Only check SIB if r/m=100 and mod!=11 (not reg-only) */
+                if (mod != 3 && rm == 4) {
+                    unsigned char sib = code[pos + 2];
+                    if ((sib & 7) == 5) {
+                        int32_t *disp = (int32_t *)(code + pos + 3);
+                        *disp -= (int32_t)code_size;
+                        pos += 7;
+                        continue;
+                    }
+                }
+            }
+
+            pos++;
+        }
+    }
+
+    /* Shift only .text symbols by code_size. */
+    for (int i = 0; i < lk->gsym_count; i++) {
+        LkSymbol *g = &lk->gsyms[i];
+        if (g->final_addr >= lk->text_base &&
+            g->final_addr < lk->rodata_base) {
+            g->final_addr += code_size;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Write ELF executable                                               */
+/* ------------------------------------------------------------------ */
+
+static int write_executable(Linker *lk, const char *output_path)
+{
+    FILE *f = fopen(output_path, "wb");
+    if (!f) {
+        lk_error(lk, "Cannot open output file: %s", output_path);
+        return -1;
+    }
+
+    size_t phdr_off = 64;
+    size_t text_off = phdr_off + 2 * 56;
+    text_off = (text_off + 0xFFF) & ~(size_t)0xFFF;
+
+    size_t rodata_off = text_off + (lk->rodata_base - lk->text_base);
+    rodata_off = (rodata_off + 15) & ~(size_t)15;
+
+    size_t data_off = rodata_off + lk->rodata_size;
+    data_off = (data_off + 0xFFF) & ~(size_t)0xFFF;  // page-align for PT_LOAD
+
+    /* Build .shstrtab. */
+    char shstrtab_buf[512] = {0};
+    int pos = 1;
+    const char *names[] = {
+        ".text", ".rodata", ".data", ".bss",
+        ".symtab", ".strtab", ".shstrtab"
+    };
+    int name_offsets[7];
+    for (int i = 0; i < 7; i++) {
+        name_offsets[i] = pos;
+        strcpy(shstrtab_buf + pos, names[i]);
+        pos += (int)strlen(names[i]) + 1;
+    }
+    size_t shstrtab_size = (size_t)pos;
+
+    size_t shstrtab_off = data_off + lk->data_size;
+
+    /* Build symbol string table. */
+    char symstr_buf[4096] = {0};
+    int symstr_pos = 0;
+    for (int i = 0; i < lk->gsym_count; i++) {
+        LkSymbol *g = &lk->gsyms[i];
+        if (!g->name[0]) continue;
+        int found = 0;
+        for (int j = 0; j < symstr_pos; j++) {
+            if (strcmp(symstr_buf + j, g->name) == 0) {
+                found = j;
+                break;
+            }
+        }
+        if (!found) {
+            symstr_pos += (int)strlen(g->name) + 1;
+            strcpy(symstr_buf + symstr_pos, g->name);
+        }
+    }
+    size_t strtab_size = (size_t)symstr_pos + 1;
+
+    int symtab_count = 1 + lk->gsym_count;
+    size_t symtab_size = (size_t)symtab_count * sizeof(Elf64_Sym);
+    size_t symtab_off  = shstrtab_off + shstrtab_size;
+    size_t strtab_off  = symtab_off + symtab_size;
+
+    int shdr_count = 8;
+    size_t shdr_off = strtab_off + strtab_size;
+
+    uint64_t entry = lk->text_base;
+
+    /* ---- Write ELF header ---- */
+    Elf64_Ehdr ehdr;
+    memset(&ehdr, 0, sizeof(ehdr));
+    ehdr.e_ident[0]       = 0x7f;
+    ehdr.e_ident[1]       = 'E';
+    ehdr.e_ident[2]       = 'L';
+    ehdr.e_ident[3]       = 'F';
+    ehdr.e_ident[EI_CLASS] = ELFCLASS64;
+    ehdr.e_ident[EI_DATA]  = ELFDATA2LSB;
+    ehdr.e_ident[EI_VERSION] = 1;
+    ehdr.e_ident[EI_OSABI]  = 0;
+    ehdr.e_type          = ET_EXEC;
+    ehdr.e_machine       = EM_X86_64;
+    ehdr.e_version       = 1;
+    ehdr.e_entry         = entry;
+    ehdr.e_phoff         = (uint64_t)phdr_off;
+    ehdr.e_shoff         = (uint64_t)shdr_off;
+    ehdr.e_flags         = 0;
+    ehdr.e_ehsize        = 64;
+    ehdr.e_phentsize     = 56;
+    ehdr.e_phnum         = 2;
+    ehdr.e_shentsize     = 64;
+    ehdr.e_shnum         = (uint16_t)shdr_count;
+    ehdr.e_shstrndx      = 7;
+    fwrite(&ehdr, sizeof(ehdr), 1, f);
+
+    /* ---- Write program headers ---- */
+
+    /* Text + rodata segment: R+X
+     * Must start at p_offset=0 to cover the ELF header (kernel requirement).
+     * p_vaddr starts at 0x400000; text data is at offset text_off within this
+     * segment, padded with zeros from offset 0 to text_off.
+     */
+    Elf64_Phdr phdr_text;
+    memset(&phdr_text, 0, sizeof(phdr_text));
+    phdr_text.p_type   = PT_LOAD;
+    phdr_text.p_flags  = PF_R | PF_X;
+    phdr_text.p_offset = 0;                          // MUST cover ELF header
+    phdr_text.p_vaddr  = 0x400000;                   // base of first page
+    uint64_t text_filesz = text_off +                // includes header+padding
+        (lk->rodata_base - lk->text_base) + lk->rodata_size;
+    phdr_text.p_filesz = text_filesz;
+    uint64_t text_memsz = (text_filesz + 0xFFF) & ~(uint64_t)0xFFF;
+    phdr_text.p_memsz  = text_memsz;
+    phdr_text.p_align  = 0x1000;
+    fwrite(&phdr_text, sizeof(phdr_text), 1, f);
+
+    /* Data + bss segment: RW (also serves as stack space) */
+    Elf64_Phdr phdr_data;
+    memset(&phdr_data, 0, sizeof(phdr_data));
+    phdr_data.p_type   = PT_LOAD;
+    phdr_data.p_flags  = PF_R | PF_W;
+    phdr_data.p_offset = (uint64_t)data_off;
+    phdr_data.p_vaddr  = lk->data_base;
+    phdr_data.p_filesz = (uint64_t)lk->data_size;
+    uint64_t data_memsz = lk->data_size + lk->bss_size;
+    if (data_memsz < 0x10000) data_memsz = 0x10000;
+    phdr_data.p_memsz  = data_memsz;
+    phdr_data.p_align  = 0x1000;
+    fwrite(&phdr_data, sizeof(phdr_data), 1, f);
+
+    /* ---- Pad to text ---- */
+    {
+        size_t pad = text_off - phdr_off - 2 * 56;
+        unsigned char zero = 0;
+        while (pad--) fputc(zero, f);
+    }
+
+    /* ---- Write .text ---- */
+    if (lk->text_size > 0)
+        fwrite(lk->text_data, 1, lk->text_size, f);
+
+    /* ---- Pad to rodata ---- */
+    {
+        size_t pad = rodata_off - text_off - lk->text_size;
+        unsigned char zero = 0;
+        while (pad--) fputc(zero, f);
+    }
+
+    /* ---- Write .rodata ---- */
+    if (lk->rodata_size > 0)
+        fwrite(lk->rodata_data, 1, lk->rodata_size, f);
+
+    /* ---- Pad to data ---- */
+    {
+        size_t pad = data_off - rodata_off - lk->rodata_size;
+        unsigned char zero = 0;
+        while (pad--) fputc(zero, f);
+    }
+
+    /* ---- Write .data ---- */
+    if (lk->data_size > 0)
+        fwrite(lk->data_data, 1, lk->data_size, f);
+
+    /* ---- Pad to shstrtab ---- */
+    {
+        size_t pad = shstrtab_off - data_off - lk->data_size;
+        unsigned char zero = 0;
+        while (pad--) fputc(zero, f);
+    }
+
+    /* ---- Write .shstrtab ---- */
+    fwrite(shstrtab_buf, 1, shstrtab_size, f);
+
+    /* ---- Write .symtab ---- */
+    {
+        Elf64_Sym null_sym = {0};
+        fwrite(&null_sym, sizeof(null_sym), 1, f);
+
+        for (int i = 0; i < lk->gsym_count; i++) {
+            LkSymbol *g = &lk->gsyms[i];
+            Elf64_Sym sym;
+            memset(&sym, 0, sizeof(sym));
+
+            for (int j = 0; j < symstr_pos; j++) {
+                if (strcmp(symstr_buf + j, g->name) == 0) {
+                    sym.st_name = (uint32_t)j;
+                    break;
+                }
+            }
+
+            sym.st_info  = (g->bind << 4) | (g->type & 0xF);
+            sym.st_other = 0;
+
+            if (g->is_extern) {
+                sym.st_shndx = SHN_UNDEF;
+                sym.st_value = 0;
+            } else {
+                uint64_t addr = g->final_addr;
+                if (addr >= lk->text_base &&
+                    addr < lk->text_base + lk->text_size) {
+                    sym.st_shndx = 1;
+                } else if (addr >= lk->rodata_base &&
+                           addr < lk->rodata_base + lk->rodata_size) {
+                    sym.st_shndx = 2;
+                } else if (addr >= lk->data_base &&
+                           addr < lk->data_base + lk->data_size) {
+                    sym.st_shndx = 3;
+                } else if (addr >= lk->bss_base &&
+                           addr < lk->bss_base + lk->bss_size) {
+                    sym.st_shndx = 4;
+                } else {
+                    sym.st_shndx = 1;
+                }
+                sym.st_value = addr;
+            }
+            sym.st_size = g->size;
+            fwrite(&sym, sizeof(sym), 1, f);
+        }
+    }
+
+    /* ---- Write .strtab ---- */
+    fwrite(symstr_buf, 1, strtab_size, f);
+
+    /* ---- Pad to section headers ---- */
+    {
+        size_t pad = shdr_off - strtab_off - strtab_size;
+        unsigned char zero = 0;
+        while (pad--) fputc(zero, f);
+    }
+
+    /* ---- Write section headers ---- */
+    Elf64_Shdr shdrs[8];
+    memset(shdrs, 0, sizeof(shdrs));
+
+    shdrs[1].sh_name      = (uint32_t)name_offsets[0];
+    shdrs[1].sh_type      = SHT_PROGBITS;
+    shdrs[1].sh_flags     = SHF_ALLOC | SHF_EXECINSTR;
+    shdrs[1].sh_addr      = lk->text_base;
+    shdrs[1].sh_offset    = (uint64_t)text_off;
+    shdrs[1].sh_size      = lk->text_size;
+    shdrs[1].sh_addralign = 16;
+
+    shdrs[2].sh_name      = (uint32_t)name_offsets[1];
+    shdrs[2].sh_type      = SHT_PROGBITS;
+    shdrs[2].sh_flags     = SHF_ALLOC;
+    shdrs[2].sh_addr      = lk->rodata_base;
+    shdrs[2].sh_offset    = (uint64_t)rodata_off;
+    shdrs[2].sh_size      = lk->rodata_size;
+    shdrs[2].sh_addralign = 16;
+
+    shdrs[3].sh_name      = (uint32_t)name_offsets[2];
+    shdrs[3].sh_type      = SHT_PROGBITS;
+    shdrs[3].sh_flags     = SHF_ALLOC | SHF_WRITE;
+    shdrs[3].sh_addr      = lk->data_base;
+    shdrs[3].sh_offset    = (uint64_t)data_off;
+    shdrs[3].sh_size      = lk->data_size;
+    shdrs[3].sh_addralign = 16;
+
+    shdrs[4].sh_name      = (uint32_t)name_offsets[3];
+    shdrs[4].sh_type      = SHT_NOBITS;
+    shdrs[4].sh_flags     = SHF_ALLOC | SHF_WRITE;
+    shdrs[4].sh_addr      = lk->bss_base;
+    shdrs[4].sh_size      = lk->bss_size;
+    shdrs[4].sh_addralign = 16;
+
+    shdrs[5].sh_name      = (uint32_t)name_offsets[4];
+    shdrs[5].sh_type      = SHT_SYMTAB;
+    shdrs[5].sh_offset    = (uint64_t)symtab_off;
+    shdrs[5].sh_size      = symtab_size;
+    shdrs[5].sh_link      = 6;
+    shdrs[5].sh_info      = 1;
+    shdrs[5].sh_entsize   = sizeof(Elf64_Sym);
+
+    shdrs[6].sh_name      = (uint32_t)name_offsets[5];
+    shdrs[6].sh_type      = SHT_STRTAB;
+    shdrs[6].sh_offset    = (uint64_t)strtab_off;
+    shdrs[6].sh_size      = strtab_size;
+
+    shdrs[7].sh_name      = (uint32_t)name_offsets[6];
+    shdrs[7].sh_type      = SHT_STRTAB;
+    shdrs[7].sh_offset    = (uint64_t)shstrtab_off;
+    shdrs[7].sh_size      = shstrtab_size;
+
+    fwrite(shdrs, sizeof(shdrs), 1, f);
+
+    fclose(f);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  API: link                                                          */
+/* ------------------------------------------------------------------ */
+
+int linker_link(Linker *lk, const char *output_path)
+{
+    if (lk->obj_count == 0) {
+        lk_error(lk, "No object files loaded");
+        return -1;
+    }
+
+    /* Step 1: Merge all sections from all object files. */
+    merge_sections(lk);
+
+    /* Step 2: Build global symbol table and resolve cross-object refs. */
+    build_global_symbols(lk);
+
+    /* Check for unresolved symbols. */
+    for (int i = 0; i < lk->gsym_count; i++) {
+        if (lk->gsyms[i].is_extern) {
+            lk_error(lk, "Unresolved symbol: %s", lk->gsyms[i].name);
+            return -1;
+        }
+    }
+
+    /* Step 3: Find main address and emit _start stub.
+     * The stub prepends code to .text, shifting all text addresses
+     * by code_size. We must do this BEFORE applying relocations so
+     * that PC-relative offsets are computed with the correct addresses. */
+    uint64_t main_addr = 0;
+    for (int i = 0; i < lk->gsym_count; i++) {
+        if (strcmp(lk->gsyms[i].name, lk->entry_name) == 0 &&
+            !lk->gsyms[i].is_extern) {
+            main_addr = lk->gsyms[i].final_addr;
+            break;
+        }
+    }
+    if (!main_addr) {
+        main_addr = lk->text_base;
+    }
+    emit_start_stub(lk, main_addr);
+
+    /* Step 4: Apply relocations with final addresses. */
+    if (apply_relocations(lk) != 0)
+        return -1;
+
+    /* Step 5: Write the output executable. */
+    if (write_executable(lk, output_path) != 0)
+        return -1;
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  API: error / status                                                */
+/* ------------------------------------------------------------------ */
+
+const char *linker_error(Linker *lk)
+{
+    return lk ? lk->error : NULL;
+}
+
+void linker_print_status(Linker *lk)
+{
+    printf("Linker status:\n");
+    printf("  Objects: %d\n", lk->obj_count);
+    printf("  Global symbols: %d\n", lk->gsym_count);
+    printf("  Text: %zu bytes (base 0x%lx)\n",
+           lk->text_size, (unsigned long)lk->text_base);
+    printf("  Rodata: %zu bytes (base 0x%lx)\n",
+           lk->rodata_size, (unsigned long)lk->rodata_base);
+    printf("  Data: %zu bytes (base 0x%lx)\n",
+           lk->data_size, (unsigned long)lk->data_base);
+    printf("  BSS: %zu bytes (base 0x%lx)\n",
+           lk->bss_size, (unsigned long)lk->bss_base);
+    printf("  Entry: %s\n", lk->entry_name);
+}
